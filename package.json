@@ -1,0 +1,59 @@
+{
+  "name": "@catalystlabs/awm",
+  "version": "1.0.0",
+  "description": "Appwrite Migration Tool - Schema management and code generation for Appwrite databases",
+  "type": "module",
+  "main": "awm.js",
+  "bin": {
+    "awm": "./awm.js"
+  },
+  "scripts": {
+    "test": "node awm.js status",
+    "lint": "eslint *.js",
+    "format": "prettier --write *.js"
+  },
+  "keywords": [
+    "appwrite",
+    "migration",
+    "schema",
+    "database",
+    "typescript",
+    "zod",
+    "code-generation",
+    "backend-as-a-service",
+    "baas"
+  ],
+  "author": "Catalyst Labs",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "eslint": "^8.50.0",
+    "prettier": "^3.0.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ccollier86/awm.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ccollier86/awm/issues"
+  },
+  "homepage": "https://github.com/ccollier86/awm#readme",
+  "files": [
+    "awm.js",
+    "type-generator.js",
+    "zod-generator.js",
+    "init.js",
+    "README.md",
+    "LICENSE",
+    ".env.example",
+    "appwrite.schema.example"
+  ]
+}

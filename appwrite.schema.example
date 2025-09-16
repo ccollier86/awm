@@ -1,0 +1,126 @@
+// Example Appwrite Schema
+// Copy this file to 'appwrite.schema' and customize for your project
+
+database {
+  name = "example-database"
+  id   = "example-database"
+}
+
+// ==========================================
+// Example: Blog Application Schema
+// ==========================================
+
+// Users collection
+collection users {
+  username        String   @size(50) @required @unique
+  email          String   @size(255) @required @unique
+  full_name      String   @size(255) @required
+  bio            String   @size(1000)
+  avatar_url     String   @size(500)
+  verified       Boolean  @default(false)
+  created_at     DateTime @default(now)
+  updated_at     DateTime @default(now)
+  
+  @@index([email])
+  @@index([username])
+}
+
+// Blog posts collection
+collection posts {
+  title          String   @size(255) @required
+  slug           String   @size(255) @required @unique
+  content        String   @size(10000) @required
+  excerpt        String   @size(500)
+  featured_image String   @size(500)
+  author_id      String   @required
+  status         String   @size(20) @default("draft")  // draft, published, archived
+  published_at   DateTime
+  views          Int      @default(0)
+  likes          Int      @default(0)
+  tags           String[] @array @size(50)
+  created_at     DateTime @default(now)
+  updated_at     DateTime @default(now)
+  
+  // Relationship to author (Phase 2)
+  author         String   @relationship(to: "users", type: "many-to-one", twoWayKey: "posts", onDelete: "cascade")
+  
+  @@index([slug])
+  @@index([author_id])
+  @@index([status])
+  @@index([published_at, desc])
+}
+
+// Comments collection
+collection comments {
+  post_id        String   @required
+  author_id      String   @required
+  content        String   @size(2000) @required
+  parent_id      String   // For nested comments
+  likes          Int      @default(0)
+  is_edited      Boolean  @default(false)
+  created_at     DateTime @default(now)
+  updated_at     DateTime @default(now)
+  
+  // Relationships (Phase 2)
+  post           String   @relationship(to: "posts", type: "many-to-one", twoWayKey: "comments", onDelete: "cascade")
+  author         String   @relationship(to: "users", type: "many-to-one", twoWayKey: "comments", onDelete: "cascade")
+  parent         String   @relationship(to: "comments", type: "many-to-one", twoWayKey: "replies", onDelete: "cascade")
+  
+  @@index([post_id])
+  @@index([author_id])
+  @@index([parent_id])
+}
+
+// Categories collection
+collection categories {
+  name           String   @size(100) @required @unique
+  slug           String   @size(100) @required @unique
+  description    String   @size(500)
+  parent_id      String   // For nested categories
+  post_count     Int      @default(0)
+  created_at     DateTime @default(now)
+  
+  // Relationship to parent category (Phase 2)
+  parent         String   @relationship(to: "categories", type: "many-to-one", twoWayKey: "children", onDelete: "restrict")
+  
+  @@index([slug])
+  @@index([parent_id])
+}
+
+// Post categories (many-to-many junction)
+collection post_categories {
+  post_id        String   @required
+  category_id    String   @required
+  created_at     DateTime @default(now)
+  
+  // Relationships (Phase 2)
+  post           String   @relationship(to: "posts", type: "many-to-one", twoWayKey: "post_categories", onDelete: "cascade")
+  category       String   @relationship(to: "categories", type: "many-to-one", twoWayKey: "post_categories", onDelete: "cascade")
+  
+  @@unique([post_id, category_id])
+  @@index([post_id])
+  @@index([category_id])
+}
+
+// ==========================================
+// Notes on Schema Design
+// ==========================================
+
+/*
+Arrays vs Relationships:
+- Use arrays for simple many-to-many (tags, roles)
+- Use relationship attributes for referential integrity
+- Use junction tables for complex many-to-many with metadata
+
+Migration Process:
+1. Run 'awm apply' to create collections and attributes
+2. Run 'awm relationships' to add relationship attributes
+3. Run 'awm generate' to create TypeScript types and Zod schemas
+
+Best Practices:
+- Always add indexes for foreign keys
+- Use @unique for natural keys (slug, email)
+- Set appropriate @size limits
+- Include created_at/updated_at for audit trails
+- Use enums via validation in your application layer
+*/

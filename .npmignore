@@ -1,0 +1,39 @@
+# Development files
+.env
+.awm-state.db
+*.log
+node_modules/
+
+# User schema files (don't include in package)
+appwrite.schema
+/migrations/
+/types/
+/schemas/
+
+# Config files
+.awm.json
+awm.config.json
+config/
+
+# Test files
+test/
+*.test.js
+*.spec.js
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Build files
+dist/
+build/
+
+# Keep example files
+!appwrite.schema.example
+!.env.example
