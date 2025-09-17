@@ -37,3 +37,6 @@ build/
 # Keep example files
 !appwrite.schema.example
 !.env.example
+
+${HOME}
+appwrite.config.json

@@ -20,3 +20,5 @@ migrations/
 # Misc
 .DS_Store
 ${HOME}/
+
+appwrite.config.json
