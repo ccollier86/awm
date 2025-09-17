@@ -6,7 +6,7 @@ A powerful schema management and code generation tool for Appwrite databases. AW
 
 - 📋 **Schema Management** - Define your database schema in a simple DSL
 - 🔄 **Two-Phase Migrations** - Apply collections first, then relationships
-- 📊 **Migration Tracking** - SQLite-based state tracking with rollback support
+- 📊 **Migration Tracking** - Appwrite-managed history with rollback support
 - 🎯 **TypeScript Generation** - Auto-generate types from your schema
 - ✅ **Zod Schema Generation** - Runtime validation with Zod schemas
 - 🔧 **Environment Configuration** - Flexible config via env vars or config files
@@ -70,13 +70,11 @@ collection posts {
 # Required
 APPWRITE_PROJECT_ID=your-project-id
 APPWRITE_ENDPOINT=http://localhost/v1  # For self-hosted
-APPWRITE_API_KEY=your-api-key          # Optional for client SDK
+APPWRITE_API_KEY=your-api-key
 
-# Optional - Override defaults
+# Optional overrides
 APPWRITE_DATABASE_ID=my-database
 AWM_SCHEMA=appwrite.schema
-AWM_MIGRATIONS_DIR=migrations
-AWM_STATE_DB=.awm-state.db
 AWM_DEBUG=false
 ```
 
@@ -108,9 +106,8 @@ awm generate-zod schemas/appwrite.schemas.ts
 | `awm apply` | Apply schema (collections & attributes) |
 | `awm relationships` | Apply relationship attributes (Phase 2) |
 | `awm status` | Show current migration status |
-| `awm sync` | Sync state with Appwrite |
-| `awm reset` | Reset migration tracking |
-| `awm rollback <version>` | Rollback to a specific version |
+| `awm reset` | Reset migration history |
+| `awm rollback` | Rollback the most recent apply |
 | `awm generate-types [path]` | Generate TypeScript types |
 | `awm generate-zod [path]` | Generate Zod schemas |
 | `awm generate` | Generate both types and schemas |

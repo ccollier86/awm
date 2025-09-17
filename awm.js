@@ -1,25 +1,20 @@
 #!/usr/bin/env node
 
-/**
- * AWM - Appwrite Migration Tool (Improved)
- *
- * Features:
- * - Tracks migration state in SQLite database
- * - Only creates/modifies what doesn't exist
- * - Supports two-phase migrations (collections then relationships)
- * - Proper rollback support
- * - Dry-run mode
- */
-
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import { execSync } from 'child_process';
-import Database from 'better-sqlite3';
 import crypto from 'crypto';
 import readline from 'readline';
 import dotenv from 'dotenv';
 
-// Colors for console output
+import {
+  AppwriteClient,
+  AppwriteStateStore,
+  AppwriteLockManager,
+  AppwriteSchemaInspector
+} from './lib/appwrite.js';
+
 const colors = {
   reset: '\x1b[0m',
   bright: '\x1b[1m',
@@ -36,219 +31,394 @@ class AWMImproved {
   constructor() {
     this.root = process.cwd();
     this.config = this.loadConfig();
-    
-    // Configuration - ENV vars take precedence over config file
+
     this.schemaFile = path.resolve(this.root, process.env.AWM_SCHEMA || this.config.schemaPath || 'appwrite.schema');
-    this.migrationsDir = path.resolve(this.root, process.env.AWM_MIGRATIONS_DIR || this.config.migrationsDir || 'migrations');
-    this.stateDbFile = path.join(this.migrationsDir, process.env.AWM_STATE_DB || this.config.stateDb || '.awm-state.db');
-    
-    // Appwrite connection - ENV first, config second, sensible defaults last
+
     this.appwriteProject = process.env.APPWRITE_PROJECT_ID || this.config.projectId;
     this.appwriteEndpoint = process.env.APPWRITE_ENDPOINT || this.config.endpoint || 'http://localhost/v1';
     this.appwriteKey = process.env.APPWRITE_API_KEY || this.config.apiKey;
     this.databaseId = process.env.APPWRITE_DATABASE_ID || this.config.databaseId || this.extractDatabaseId();
-    
-    // Flags
+
     this.dryRun = false;
     this.debug = process.env.AWM_DEBUG === 'true' || this.config.debug;
-    
-    // Initialize state database
-    this.initStateDb();
-    
-    // CLI
+    this.force = false;
+    this.lockOwner = process.env.AWM_LOCK_OWNER || os.hostname();
+
+    this.appwriteClient = new AppwriteClient({
+      endpoint: this.appwriteEndpoint,
+      projectId: this.appwriteProject,
+      apiKey: this.appwriteKey
+    });
+
+    this.stateStore = new AppwriteStateStore({
+      client: this.appwriteClient,
+      databaseId: this.databaseId
+    });
+
+    this.lockManager = new AppwriteLockManager({
+      client: this.appwriteClient,
+      databaseId: this.databaseId
+    });
+
+    this.schemaInspector = new AppwriteSchemaInspector({
+      client: this.appwriteClient,
+      databaseId: this.databaseId
+    });
+
+    this.ready = this.bootstrap();
+
     const argv = process.argv.slice(2);
     this.command = argv[0];
     this.args = argv.slice(1);
-    
-    // Parse flags
+
     for (let i = 0; i < this.args.length; i++) {
-      const a = this.args[i];
-      if (a === '--dry-run') this.dryRun = true;
-      if (a === '--yes') this.nonInteractive = true;
-      if (a === '--force') this.force = true;
+      const arg = this.args[i];
+      if (arg === '--dry-run') this.dryRun = true;
+      if (arg === '--force') this.force = true;
+      if (arg === '--yes') this.nonInteractive = true;
+    }
+  }
+
+  async bootstrap() {
+    if (!this.appwriteProject || !this.appwriteKey) {
+      return;
+    }
+
+    try {
+      await this.stateStore.init();
+      await this.lockManager.init();
+    } catch (error) {
+      console.error(`${colors.red}Failed to initialise Appwrite state: ${error.message}${colors.reset}`);
     }
   }
 
   loadConfig() {
-    // Try multiple config locations
     const configLocations = [
       path.join(this.root, 'awm.config.json'),
       path.join(this.root, '.awm.json'),
       path.join(this.root, 'config', 'awm.json'),
       path.join(this.root, '.config', 'awm.json')
     ];
-    
+
     for (const configFile of configLocations) {
       if (fs.existsSync(configFile)) {
-        if (this.debug) console.log(`${colors.gray}Loading config from: ${configFile}${colors.reset}`);
         return JSON.parse(fs.readFileSync(configFile, 'utf8'));
       }
     }
-    
-    // Check for .env file
+
     const envFile = path.join(this.root, '.env');
     if (fs.existsSync(envFile)) {
       dotenv.config({ path: envFile });
     }
-    
+
     return {};
   }
-  
-  extractDatabaseId() {
-    // Try to extract database ID from schema if not provided
-    if (fs.existsSync(this.schemaFile)) {
-      const content = fs.readFileSync(this.schemaFile, 'utf8');
-      const match = content.match(/database\s*{\s*[^}]*id\s*=\s*"([^"]+)"/);
-      if (match) return match[1];
-    }
-    return 'database';
-  }
 
-  initStateDb() {
-    if (!fs.existsSync(this.migrationsDir)) {
-      fs.mkdirSync(this.migrationsDir, { recursive: true });
-    }
-    
-    this.db = new Database(this.stateDbFile);
-    
-    // Create tables if they don't exist
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS migrations (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        phase INTEGER DEFAULT 1,
-        applied_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        checksum TEXT,
-        status TEXT DEFAULT 'pending',
-        error_message TEXT
-      );
-      
-      CREATE TABLE IF NOT EXISTS collections (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        checksum TEXT
-      );
-      
-      CREATE TABLE IF NOT EXISTS attributes (
-        id TEXT PRIMARY KEY,
-        collection_id TEXT NOT NULL,
-        key TEXT NOT NULL,
-        type TEXT NOT NULL,
-        size INTEGER,
-        required BOOLEAN DEFAULT 0,
-        is_array BOOLEAN DEFAULT 0,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(collection_id, key),
-        FOREIGN KEY (collection_id) REFERENCES collections(id)
-      );
-      
-      CREATE TABLE IF NOT EXISTS relationships (
-        id TEXT PRIMARY KEY,
-        from_collection TEXT NOT NULL,
-        to_collection TEXT NOT NULL,
-        type TEXT NOT NULL,
-        attribute_name TEXT NOT NULL,
-        two_way_key TEXT,
-        on_delete TEXT DEFAULT 'restrict',
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(from_collection, attribute_name)
-      );
-      
-      CREATE TABLE IF NOT EXISTS indexes (
-        id TEXT PRIMARY KEY,
-        collection_id TEXT NOT NULL,
-        key TEXT NOT NULL,
-        type TEXT NOT NULL,
-        attributes TEXT NOT NULL,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(collection_id, key),
-        FOREIGN KEY (collection_id) REFERENCES collections(id)
-      );
-    `);
+  extractDatabaseId() {
+    if (!fs.existsSync(this.schemaFile)) return 'database';
+    const content = fs.readFileSync(this.schemaFile, 'utf8');
+    const match = content.match(/database\s*{[^}]*id\s*=\s*"([^"]+)"/);
+    return match ? match[1] : 'database';
   }
 
   async run() {
-    try {
-      switch (this.command) {
-        case 'init':
-          await this.init();
-          break;
-        case 'plan':
-          await this.plan();
-          break;
-        case 'apply':
-          await this.apply();
-          break;
-        case 'status':
-          await this.status();
-          break;
-        case 'rollback':
-          await this.rollback(this.firstPositionalArg());
-          break;
-        case 'reset':
-          await this.reset();
-          break;
-        case 'sync':
-          await this.sync();
-          break;
-        case 'relationships':
-          await this.applyRelationships();
-          break;
-        case 'generate-types':
-          await this.generateTypes(this.firstPositionalArg() || './types/appwrite.types.ts');
-          break;
-        case 'generate-zod':
-          await this.generateZod(this.firstPositionalArg() || './schemas/appwrite.schemas.ts');
-          break;
-        case 'generate': {
-          const [typesPath, zodPath] = this.positionalArgs(2);
-          await this.generateArtifacts(typesPath || './types/appwrite.types.ts', zodPath || './schemas/appwrite.schemas.ts');
-          break;
-        }
-        case 'help':
-        case undefined:
-          this.showHelp();
-          break;
-        default:
-          console.error(`${colors.red}Unknown command: ${this.command}${colors.reset}`);
-          this.showHelp();
-          process.exit(1);
-      }
-    } catch (error) {
-      console.error(`${colors.red}✗ Error: ${error.message}${colors.reset}`);
-      if (this.config.debug) {
-        console.error(error.stack);
-      }
-      process.exit(1);
-    } finally {
-      this.db?.close();
-    }
-  }
+    await this.ready;
 
-  positionalArgs(limit = Infinity) {
-    const values = [];
-    for (const arg of this.args) {
-      if (arg?.startsWith('--')) continue;
-      values.push(arg);
-      if (values.length >= limit) break;
+    switch (this.command) {
+      case 'init':
+        await this.init();
+        break;
+      case 'plan':
+        await this.plan();
+        break;
+      case 'apply':
+        await this.apply();
+        break;
+      case 'relationships':
+        await this.applyRelationships();
+        break;
+      case 'rollback':
+        await this.rollback();
+        break;
+      case 'status':
+        await this.status();
+        break;
+      case 'reset':
+        await this.reset();
+        break;
+      case 'generate-types':
+        await this.generateTypes(this.firstPositionalArg() || './types/appwrite.types.ts');
+        break;
+      case 'generate-zod':
+        await this.generateZod(this.firstPositionalArg() || './types/appwrite.zod.ts');
+        break;
+      case 'generate':
+        await this.generateArtifacts('./types/appwrite.types.ts', './types/appwrite.zod.ts');
+        break;
+      default:
+        this.showHelp();
     }
-    return values;
   }
 
   firstPositionalArg() {
-    return this.positionalArgs(1)[0];
+    return this.args.find(a => !a.startsWith('--'));
   }
 
-  async loadGenerators() {
-    if (!this.generators) {
-      const [{ default: TypeGenerator }, { default: ZodGenerator }] = await Promise.all([
-        import('./type-generator.js'),
-        import('./zod-generator.js')
-      ]);
-      this.generators = { TypeGenerator, ZodGenerator };
+  async init() {
+    console.log(`${colors.cyan}Initializing AWM in ${this.root}${colors.reset}`);
+    const { default: initProject } = await import('./init.js');
+    await initProject();
+    console.log(`\n${colors.green}✓ Initialization completed${colors.reset}`);
+  }
+
+  async plan() {
+    this.ensureConfig();
+    const schema = this.parseSchema(fs.readFileSync(this.schemaFile, 'utf8'));
+    const changes = await this.calculateChanges(schema);
+    const relationships = await this.calculateRelationships(schema);
+
+    if (changes.collections.length === 0 && changes.attributes.length === 0 && changes.indexes.length === 0 && relationships.length === 0) {
+      console.log(`${colors.green}✓${colors.reset} Schema is already in sync.`);
+      return;
     }
-    return this.generators;
+
+    console.log(`${colors.yellow}Planned changes:${colors.reset}`);
+    if (changes.collections.length) {
+      console.log(`${colors.bright}Collections:${colors.reset}`);
+      for (const coll of changes.collections) {
+        console.log(`  ${colors.green}+${colors.reset} ${coll.name} (${coll.id})`);
+      }
+    }
+
+    if (changes.attributes.length) {
+      console.log(`\n${colors.bright}Attributes:${colors.reset}`);
+      for (const attr of changes.attributes) {
+        console.log(`  ${colors.green}+${colors.reset} ${attr.collection_id}.${attr.key} (${attr.type}${attr.array ? '[]' : ''})`);
+      }
+    }
+
+    if (changes.indexes.length) {
+      console.log(`\n${colors.bright}Indexes:${colors.reset}`);
+      for (const idx of changes.indexes) {
+        console.log(`  ${colors.green}+${colors.reset} ${idx.collection_id}.${idx.key}`);
+      }
+    }
+
+    if (relationships.length) {
+      console.log(`\n${colors.bright}Relationships:${colors.reset}`);
+      for (const rel of relationships) {
+        console.log(`  ${colors.green}+${colors.reset} ${rel.collection}.${rel.key} → ${rel.to_collection} (${rel.type})`);
+      }
+    }
+
+    if (this.dryRun) {
+      console.log(`\n${colors.gray}Dry run - no changes scheduled${colors.reset}`);
+    }
+  }
+
+  async apply() {
+    this.ensureConfig();
+
+    await this.withLock('schema-apply', async () => {
+      const schema = this.parseSchema(fs.readFileSync(this.schemaFile, 'utf8'));
+      const changes = await this.calculateChanges(schema);
+
+      if (changes.collections.length === 0 && changes.attributes.length === 0 && changes.indexes.length === 0) {
+        console.log(`${colors.green}✓${colors.reset} Nothing to apply.`);
+        return;
+      }
+
+      if (this.dryRun) {
+        console.log(`${colors.gray}Dry run - skipping apply${colors.reset}`);
+        return;
+      }
+
+      console.log(`${colors.cyan}Applying schema changes...${colors.reset}\n`);
+      await this.applyChanges(changes);
+
+      const checksum = this.generateChecksum(changes);
+      await this.stateStore.recordHistory({
+        type: 'apply',
+        databaseId: this.databaseId,
+        checksum,
+        changes: this.compactChanges(changes)
+      });
+
+      console.log(`\n${colors.green}✓ Apply completed${colors.reset}`);
+    });
+  }
+
+  async applyRelationships() {
+    this.ensureConfig();
+
+    await this.withLock('schema-relationships', async () => {
+      const schema = this.parseSchema(fs.readFileSync(this.schemaFile, 'utf8'));
+      const relationships = await this.calculateRelationships(schema);
+
+      if (!relationships.length) {
+        console.log(`${colors.green}✓${colors.reset} No relationship changes needed.`);
+        return;
+      }
+
+      if (this.dryRun) {
+        console.log(`${colors.gray}Dry run - skipping relationships${colors.reset}`);
+        return;
+      }
+
+      console.log(`${colors.cyan}Applying relationship attributes...${colors.reset}\n`);
+      for (const rel of relationships) {
+        try {
+          const relType = (rel.type || 'many-to-one')
+            .split('-')
+            .map((part, index) => index === 0 ? part.toLowerCase() : part.charAt(0).toUpperCase() + part.slice(1))
+            .join('');
+          execSync(`appwrite databases create-relationship-attribute \
+            --database-id ${this.databaseId} \
+            --collection-id "${rel.collection}" \
+            --related-collection-id "${rel.to_collection}" \
+            --type "${relType}" \
+            --key "${rel.key}" \
+            ${rel.two_way_key ? `--two-way-key "${rel.two_way_key}"` : ''} \
+            --on-delete "${rel.on_delete || 'restrict'}"`, { stdio: 'pipe' });
+          console.log(`  ${colors.green}✓${colors.reset} Relationship ${rel.collection}.${rel.key}`);
+        } catch (error) {
+          if (error.stderr?.toString()?.includes('already exists')) {
+            console.log(`  ${colors.gray}○${colors.reset} Relationship already exists: ${rel.collection}.${rel.key}`);
+          } else {
+            throw error;
+          }
+        }
+      }
+
+      await this.stateStore.recordHistory({
+        type: 'relationships',
+        databaseId: this.databaseId,
+        relationships: relationships.map(rel => ({
+          collection: rel.collection,
+          key: rel.key,
+          to_collection: rel.to_collection,
+          type: rel.type
+        }))
+      });
+
+      console.log(`\n${colors.green}✓ Relationships applied${colors.reset}`);
+    });
+  }
+
+  async rollback() {
+    this.ensureConfig();
+
+    await this.withLock('schema-rollback', async () => {
+      const history = await this.stateStore.latestHistory('applied');
+      if (!history) {
+        console.log(`${colors.yellow}No applied migrations found to roll back.${colors.reset}`);
+        return;
+      }
+
+      const payload = history.payload || {};
+      if (payload.type !== 'apply') {
+        console.log(`${colors.yellow}Latest history entry is not an apply run. Nothing to roll back.${colors.reset}`);
+        return;
+      }
+
+      const changes = payload.changes || {};
+      const { indexes = [], attributes = [], collections = [] } = changes;
+
+      if (this.dryRun) {
+        console.log(`${colors.gray}Dry run - rollback would remove:${colors.reset}`);
+        collections.forEach(coll => console.log(`  ${colors.red}-${colors.reset} collection ${coll.id}`));
+        attributes.forEach(attr => console.log(`  ${colors.red}-${colors.reset} attribute ${attr.collection_id}.${attr.key}`));
+        indexes.forEach(idx => console.log(`  ${colors.red}-${colors.reset} index ${idx.collection_id}.${idx.key}`));
+        return;
+      }
+
+      console.log(`${colors.cyan}Rolling back last apply...${colors.reset}`);
+
+      for (const idx of indexes) {
+        try {
+          execSync(`appwrite databases delete-index \
+            --database-id ${this.databaseId} \
+            --collection-id "${idx.collection_id}" \
+            --key "${idx.key}"`, { stdio: 'pipe' });
+          console.log(`  ${colors.red}-${colors.reset} index ${idx.collection_id}.${idx.key}`);
+        } catch (error) {
+          console.log(`  ${colors.gray}○${colors.reset} index already removed: ${idx.collection_id}.${idx.key}`);
+        }
+      }
+
+      for (const attr of attributes) {
+        try {
+          execSync(`appwrite databases delete-attribute \
+            --database-id ${this.databaseId} \
+            --collection-id "${attr.collection_id}" \
+            --key "${attr.key}"`, { stdio: 'pipe' });
+          console.log(`  ${colors.red}-${colors.reset} attribute ${attr.collection_id}.${attr.key}`);
+        } catch (error) {
+          console.log(`  ${colors.gray}○${colors.reset} attribute already removed: ${attr.collection_id}.${attr.key}`);
+        }
+      }
+
+      for (const coll of collections) {
+        try {
+          execSync(`appwrite databases delete-collection \
+            --database-id ${this.databaseId} \
+            --collection-id "${coll.id}"`, { stdio: 'pipe' });
+          console.log(`  ${colors.red}-${colors.reset} collection ${coll.id}`);
+        } catch (error) {
+          console.log(`  ${colors.gray}○${colors.reset} collection already removed: ${coll.id}`);
+        }
+      }
+
+      await this.stateStore.updateHistoryStatus(history.recordId, 'rolled_back');
+      console.log(`\n${colors.green}✓ Rollback complete${colors.reset}`);
+    });
+  }
+
+  async status() {
+    this.ensureConfig();
+
+    const remote = await this.schemaInspector.describe();
+    const collectionCount = remote.size;
+    let attributeCount = 0;
+    let indexCount = 0;
+    for (const { attributes, indexes } of remote.values()) {
+      attributeCount += attributes.length;
+      indexCount += indexes.length;
+    }
+
+    console.log(`${colors.cyan}Database Status${colors.reset}`);
+    console.log(`  Collections: ${collectionCount}`);
+    console.log(`  Attributes:  ${attributeCount}`);
+    console.log(`  Indexes:     ${indexCount}`);
+
+    const histories = await this.stateStore.listRecords('history');
+    if (histories.length) {
+      console.log(`\n${colors.bright}Recent history:${colors.reset}`);
+      histories
+        .sort((a, b) => (a.createdAt > b.createdAt ? -1 : 1))
+        .slice(0, 5)
+        .forEach(entry => {
+          const summary = entry.payload?.type || 'unknown';
+          console.log(`  ${entry.createdAt}: ${summary} (${entry.status || 'unknown'})`);
+        });
+    }
+  }
+
+  async reset() {
+    this.ensureConfig();
+
+    await this.withLock('schema-reset', async () => {
+      if (!this.nonInteractive) {
+        const confirmed = await this.prompt('This will clear migration history. Continue? (y/N): ');
+        if (!['y', 'yes'].includes((confirmed || '').toLowerCase())) {
+          console.log('Reset cancelled.');
+          return;
+        }
+      }
+
+      await this.stateStore.reset();
+      console.log(`${colors.green}✓ State cleared${colors.reset}`);
+    });
   }
 
   async generateTypes(outputPath) {
@@ -270,402 +440,201 @@ class AWMImproved {
     console.log('\n✨ All generators completed successfully!');
   }
 
-  async init() {
-    console.log(`${colors.cyan}Initializing AWM in ${this.root}${colors.reset}\n`);
+  async withLock(lockId, fn) {
+    if (!this.appwriteProject || !this.appwriteKey) {
+      throw new Error('Appwrite credentials are required for this operation');
+    }
 
-    const { default: initProject } = await import('./init.js');
-    await initProject();
-
-    console.log(`\n${colors.green}✓ AWM initialized successfully!${colors.reset}`);
+    await this.lockManager.acquire(lockId, { owner: this.lockOwner, force: this.force });
+    try {
+      return await fn();
+    } finally {
+      await this.lockManager.release(lockId, this.lockOwner);
+    }
   }
 
-  async plan() {
-    console.log(`${colors.cyan}Planning migration from schema...${colors.reset}\n`);
-    
-    // Show config being used
-    if (this.debug || !this.appwriteProject) {
-      console.log(`${colors.gray}Config:${colors.reset}`);
-      console.log(`  Endpoint: ${this.appwriteEndpoint}`);
-      console.log(`  Project: ${this.appwriteProject || colors.red + 'NOT SET' + colors.reset}`);
-      console.log(`  Database: ${this.databaseId}`);
-      console.log(`  Schema: ${this.schemaFile}`);
-      console.log();
-      
-      if (!this.appwriteProject) {
-        console.error(`${colors.red}✗ APPWRITE_PROJECT_ID not set${colors.reset}`);
-        console.log(`Set via: export APPWRITE_PROJECT_ID=your-project-id`);
-        process.exit(1);
-      }
+  ensureConfig() {
+    if (!this.appwriteProject) {
+      throw new Error('APPWRITE_PROJECT_ID is required');
     }
-    
-    const schema = this.parseSchema(fs.readFileSync(this.schemaFile, 'utf8'));
-    const changes = await this.calculateChanges(schema);
-    
-    if (changes.collections.length === 0 && 
-        changes.attributes.length === 0 && 
-        changes.indexes.length === 0) {
-      console.log(`${colors.green}✓${colors.reset} Schema is up to date. No changes needed.`);
-      return;
+    if (!this.appwriteKey) {
+      throw new Error('APPWRITE_API_KEY is required');
     }
-    
-    console.log(`${colors.yellow}Planned changes:${colors.reset}\n`);
-    
-    if (changes.collections.length > 0) {
-      console.log(`${colors.bright}Collections to create:${colors.reset}`);
-      for (const coll of changes.collections) {
-        console.log(`  ${colors.green}+${colors.reset} ${coll.name} (${coll.id})`);
-      }
-      console.log();
+    if (!this.databaseId) {
+      throw new Error('APPWRITE_DATABASE_ID is required');
     }
-    
-    if (changes.attributes.length > 0) {
-      console.log(`${colors.bright}Attributes to create:${colors.reset}`);
-      for (const attr of changes.attributes) {
-        console.log(`  ${colors.green}+${colors.reset} ${attr.collection_id}.${attr.key} (${attr.type})`);
-      }
-      console.log();
-    }
-    
-    if (changes.indexes.length > 0) {
-      console.log(`${colors.bright}Indexes to create:${colors.reset}`);
-      for (const idx of changes.indexes) {
-        console.log(`  ${colors.green}+${colors.reset} ${idx.collection_id}.${idx.key}`);
-      }
-      console.log();
-    }
-    
-    if (this.dryRun) {
-      console.log(`${colors.gray}Dry run - no changes made${colors.reset}`);
-      return;
-    }
-    
-    // Save planned changes
-    const migrationId = `migration_${Date.now()}`;
-    const stmt = this.db.prepare(`
-      INSERT INTO migrations (id, name, phase, status, checksum)
-      VALUES (?, ?, ?, ?, ?)
-    `);
-    stmt.run(
-      migrationId,
-      'Schema sync',
-      1,
-      'planned',
-      this.generateChecksum(changes)
-    );
-    
-    fs.writeFileSync(
-      path.join(this.migrationsDir, `${migrationId}.json`),
-      JSON.stringify(changes, null, 2)
-    );
-    
-    console.log(`${colors.green}✓${colors.reset} Migration planned: ${migrationId}`);
-    console.log(`Run ${colors.cyan}awm apply${colors.reset} to execute the migration`);
   }
 
-  async apply() {
-    console.log(`${colors.cyan}Applying pending migrations...${colors.reset}\n`);
-    
-    const pending = this.db.prepare(`
-      SELECT * FROM migrations 
-      WHERE status = 'planned' 
-      ORDER BY id
-    `).all();
-    
-    if (pending.length === 0) {
-      console.log(`${colors.green}✓${colors.reset} No pending migrations`);
-      return;
-    }
-    
-    for (const migration of pending) {
-      console.log(`${colors.cyan}Applying ${migration.id}...${colors.reset}`);
-      
-      const changesFile = path.join(this.migrationsDir, `${migration.id}.json`);
-      if (!fs.existsSync(changesFile)) {
-        console.error(`${colors.red}✗ Migration file not found${colors.reset}`);
+  async calculateChanges(schema) {
+    const remote = await this.schemaInspector.describe();
+
+    const changes = {
+      collections: [],
+      attributes: [],
+      indexes: []
+    };
+
+    for (const [name, coll] of Object.entries(schema.collections || {})) {
+      const collId = this.toKebabCase(name);
+      const remoteColl = remote.get(collId);
+
+      if (!remoteColl) {
+        changes.collections.push({
+          id: collId,
+          name: coll.name || name,
+          attributes: coll.attributes,
+          indexes: coll.indexes
+        });
         continue;
       }
-      
-      const changes = JSON.parse(fs.readFileSync(changesFile, 'utf8'));
-      
-      try {
-        await this.applyChanges(changes);
-        
-        this.db.prepare(`
-          UPDATE migrations 
-          SET status = 'applied', applied_at = CURRENT_TIMESTAMP
-          WHERE id = ?
-        `).run(migration.id);
-        
-        console.log(`${colors.green}✓${colors.reset} Applied successfully`);
-      } catch (error) {
-        this.db.prepare(`
-          UPDATE migrations 
-          SET status = 'failed', error_message = ?
-          WHERE id = ?
-        `).run(error.message, migration.id);
-        
-        console.error(`${colors.red}✗ Failed: ${error.message}${colors.reset}`);
-        if (!this.force) break;
+
+      const remoteAttributes = new Map();
+      for (const attr of remoteColl.attributes || []) {
+        remoteAttributes.set(attr.key, attr);
+      }
+
+      for (const [attrName, attr] of Object.entries(coll.attributes || {})) {
+        if (attr.decorators?.relationship) continue;
+        if (!remoteAttributes.has(attrName)) {
+          changes.attributes.push({
+            collection_id: collId,
+            key: attrName,
+            type: attr.type,
+            array: !!attr.array,
+            required: !!attr.required,
+            size: attr.size,
+            default: attr.default
+          });
+        }
+      }
+
+      const remoteIndexes = new Map();
+      for (const idx of remoteColl.indexes || []) {
+        remoteIndexes.set(idx.key, idx);
+      }
+
+      for (const index of coll.indexes || []) {
+        const rawKey = index.name || `idx_${(index.attributes || index.fields || []).join('_')}`;
+        const key = this.sanitizeIndexKey(rawKey);
+        if (!remoteIndexes.has(key)) {
+          changes.indexes.push({
+            collection_id: collId,
+            key,
+            type: index.type || 'key',
+            attributes: index.attributes || index.fields || [],
+            orders: index.orders || []
+          });
+        }
       }
     }
+
+    return changes;
   }
 
-  async rollback(requestedId) {
-    console.log(`${colors.cyan}Rolling back migration state...${colors.reset}\n`);
-
-    const migration = requestedId
-      ? this.db.prepare('SELECT * FROM migrations WHERE id = ?').get(requestedId)
-      : this.db.prepare(`
-          SELECT * FROM migrations
-          WHERE status = 'applied'
-          ORDER BY applied_at DESC
-          LIMIT 1
-        `).get();
-
-    if (!migration) {
-      console.log(`${colors.yellow}No applied migrations found to roll back.${colors.reset}`);
-      return;
-    }
-
-    if (migration.status !== 'applied') {
-      console.log(`${colors.yellow}Migration ${migration.id} is not applied (current status: ${migration.status}). Nothing to roll back.${colors.reset}`);
-      return;
-    }
-
-    const changesFile = path.join(this.migrationsDir, `${migration.id}.json`);
-    if (!fs.existsSync(changesFile)) {
-      console.error(`${colors.red}✗ Unable to rollback: migration plan file missing (${changesFile}).${colors.reset}`);
-      return;
-    }
-
-    const changes = JSON.parse(fs.readFileSync(changesFile, 'utf8'));
-    const dbId = this.databaseId;
-
-    const stats = { indexes: 0, attributes: 0, collections: 0 };
-
-    const deleteIndex = idx => {
-      const label = `${idx.collection_id}.${idx.key}`;
-      if (this.dryRun) {
-        stats.indexes++;
-        console.log(`  [dry-run] Would delete index: ${label}`);
-        return;
-      }
-
-      try {
-        execSync(`appwrite databases delete-index \\
-          --database-id ${dbId} \\
-          --collection-id "${idx.collection_id}" \\
-          --key "${idx.key}"`, { stdio: 'pipe' });
-        stats.indexes++;
-        console.log(`  ${colors.green}✓${colors.reset} Deleted index: ${label}`);
-      } catch (error) {
-        if (this.isIgnorableCliError(error)) {
-          console.log(`  ${colors.gray}○${colors.reset} Index already removed: ${label}`);
-        } else if (this.force) {
-          console.warn(`  ${colors.yellow}⚠${colors.reset} Failed to delete index ${label}: ${error.message}`);
-        } else {
-          throw error;
-        }
-      } finally {
-        this.db.prepare('DELETE FROM indexes WHERE id = ?').run(`${idx.collection_id}_${idx.key}`);
-      }
+  compactChanges(changes = {}) {
+    return {
+      collections: (changes.collections || []).map(coll => ({
+        id: coll.id,
+        name: coll.name
+      })),
+      attributes: (changes.attributes || []).map(attr => ({
+        collection_id: attr.collection_id,
+        key: attr.key
+      })),
+      indexes: (changes.indexes || []).map(idx => ({
+        collection_id: idx.collection_id,
+        key: this.sanitizeIndexKey(idx.key)
+      }))
     };
+  }
 
-    const deleteAttribute = attr => {
-      const label = `${attr.collection_id}.${attr.key}`;
-      if (this.dryRun) {
-        stats.attributes++;
-        console.log(`  [dry-run] Would delete attribute: ${label}`);
-        return;
+  async calculateRelationships(schema) {
+    const remote = await this.schemaInspector.describe();
+    const pending = [];
+
+    for (const [name, coll] of Object.entries(schema.collections || {})) {
+      const collId = this.toKebabCase(name);
+      const remoteColl = remote.get(collId);
+      const remoteRelationshipKeys = new Set(
+        (remoteColl?.attributes || [])
+          .filter(attr => attr.type === 'relationship')
+          .map(attr => attr.key)
+      );
+
+      for (const [attrName, attr] of Object.entries(coll.attributes || {})) {
+        const rel = attr.decorators?.relationship;
+        if (!rel) continue;
+        if (remoteRelationshipKeys.has(attrName)) continue;
+
+        pending.push({
+          collection: collId,
+          key: attrName,
+          to_collection: this.toKebabCase(rel.to || attr.type),
+          type: rel.type || 'many-to-one',
+          two_way_key: rel.twoWayKey,
+          on_delete: rel.onDelete || 'restrict'
+        });
       }
-
-      try {
-        execSync(`appwrite databases delete-attribute \\
-          --database-id ${dbId} \\
-          --collection-id "${attr.collection_id}" \\
-          --key "${attr.key}"`, { stdio: 'pipe' });
-        stats.attributes++;
-        console.log(`  ${colors.green}✓${colors.reset} Deleted attribute: ${label}`);
-      } catch (error) {
-        if (this.isIgnorableCliError(error)) {
-          console.log(`  ${colors.gray}○${colors.reset} Attribute already removed: ${label}`);
-        } else if (this.force) {
-          console.warn(`  ${colors.yellow}⚠${colors.reset} Failed to delete attribute ${label}: ${error.message}`);
-        } else {
-          throw error;
-        }
-      } finally {
-        this.db.prepare('DELETE FROM attributes WHERE id = ?').run(`${attr.collection_id}_${attr.key}`);
-      }
-    };
-
-    const deleteCollection = coll => {
-      if (this.dryRun) {
-        stats.collections++;
-        console.log(`  [dry-run] Would delete collection: ${coll.id}`);
-        return;
-      }
-
-      try {
-        execSync(`appwrite databases delete-collection \\
-          --database-id ${dbId} \\
-          --collection-id "${coll.id}"`, { stdio: 'pipe' });
-        stats.collections++;
-        console.log(`  ${colors.green}✓${colors.reset} Deleted collection: ${coll.id}`);
-      } catch (error) {
-        if (this.isIgnorableCliError(error)) {
-          console.log(`  ${colors.gray}○${colors.reset} Collection already removed: ${coll.id}`);
-        } else if (this.force) {
-          console.warn(`  ${colors.yellow}⚠${colors.reset} Failed to delete collection ${coll.id}: ${error.message}`);
-        } else {
-          throw error;
-        }
-      } finally {
-        this.db.prepare('DELETE FROM collections WHERE id = ?').run(coll.id);
-      }
-    };
-
-    try {
-      // Process indexes first to avoid attribute dependencies
-      [...(changes.indexes || [])].reverse().forEach(deleteIndex);
-      // Then attributes
-      [...(changes.attributes || [])].reverse().forEach(deleteAttribute);
-      // Finally collections
-      [...(changes.collections || [])].reverse().forEach(deleteCollection);
-
-      if (!this.dryRun) {
-        this.db.prepare(`
-          UPDATE migrations
-          SET status = 'rolled_back', applied_at = CURRENT_TIMESTAMP
-          WHERE id = ?
-        `).run(migration.id);
-      }
-
-      console.log(`\n${colors.green}✓${colors.reset} Rollback complete for ${migration.id}`);
-      console.log(`  Collections removed: ${stats.collections}`);
-      console.log(`  Attributes removed:  ${stats.attributes}`);
-      console.log(`  Indexes removed:     ${stats.indexes}`);
-    } catch (error) {
-      console.error(`${colors.red}✗ Rollback failed: ${error.message}${colors.reset}`);
-      if (!this.force) throw error;
     }
+
+    return pending;
   }
 
   async applyChanges(changes) {
     const dbId = this.databaseId;
-    
-    // Create collections
+
     for (const coll of changes.collections || []) {
-      if (this.dryRun) {
-        console.log(`  [dry-run] Would create collection: ${coll.name}`);
-        continue;
-      }
-      
       try {
         execSync(`appwrite databases create-collection \
           --database-id ${dbId} \
           --collection-id "${coll.id}" \
           --name "${coll.name}" \
-          --enabled true`, 
-          { stdio: 'pipe' }
-        );
-        
-        // Record in state DB
-        this.db.prepare(`
-          INSERT INTO collections (id, name, checksum)
-          VALUES (?, ?, ?)
-        `).run(coll.id, coll.name, this.generateChecksum(coll));
-        
-        console.log(`  ${colors.green}✓${colors.reset} Created collection: ${coll.name}`);
+          --enabled true`, { stdio: 'pipe' });
+        console.log(`  ${colors.green}✓${colors.reset} Created collection ${coll.name}`);
       } catch (error) {
-        if (!error.message.includes('already exists')) {
+        if (error.stderr?.toString()?.includes('already exists')) {
+          console.log(`  ${colors.gray}○${colors.reset} Collection already exists: ${coll.name}`);
+        } else {
           throw error;
         }
-        console.log(`  ${colors.gray}○${colors.reset} Collection already exists: ${coll.name}`);
       }
     }
-    
-    // Create attributes
+
     for (const attr of changes.attributes || []) {
-      if (this.dryRun) {
-        console.log(`  [dry-run] Would create attribute: ${attr.collection_id}.${attr.key}`);
-        continue;
-      }
-      
       try {
         const cmd = this.buildAttributeCommand(dbId, attr);
         execSync(cmd, { stdio: 'pipe' });
-        
-        // Record in state DB
-        this.db.prepare(`
-          INSERT INTO attributes (id, collection_id, key, type, size, required, is_array)
-          VALUES (?, ?, ?, ?, ?, ?, ?)
-        `).run(
-          `${attr.collection_id}_${attr.key}`,
-          attr.collection_id,
-          attr.key,
-          attr.type,
-          attr.size || null,
-          attr.required ? 1 : 0,
-          attr.array ? 1 : 0
-        );
-        
-        console.log(`  ${colors.green}✓${colors.reset} Created attribute: ${attr.collection_id}.${attr.key}`);
+        console.log(`  ${colors.green}✓${colors.reset} Created attribute ${attr.collection_id}.${attr.key}`);
       } catch (error) {
-        if (!error.message.includes('already exists')) {
+        if (error.stderr?.toString()?.includes('already exists')) {
+          console.log(`  ${colors.gray}○${colors.reset} Attribute already exists: ${attr.collection_id}.${attr.key}`);
+        } else {
           throw error;
         }
-        console.log(`  ${colors.gray}○${colors.reset} Attribute already exists: ${attr.key}`);
       }
     }
-    
-    // Create indexes
+
     for (const idx of changes.indexes || []) {
-      if (this.dryRun) {
-        console.log(`  [dry-run] Would create index: ${idx.collection_id}.${idx.key}`);
-        continue;
-      }
-      
       try {
-        const attrs = (idx.attributes || []).join(',');
-        const orders = (idx.orders || []).filter(Boolean).map(order => order.toUpperCase());
-        const orderFlag = orders.length ? ` \\
-          --orders "${orders.join(',')}"` : '';
-
-        execSync(`appwrite databases create-index \
-          --database-id ${dbId} \
-          --collection-id "${idx.collection_id}" \
-          --key "${idx.key}" \
-          --type "${idx.type}" \
-          --attributes "${attrs}"${orderFlag}`,
-          { stdio: 'pipe' }
-        );
-        
-        // Record in state DB
-        this.db.prepare(`
-          INSERT INTO indexes (id, collection_id, key, type, attributes)
-          VALUES (?, ?, ?, ?, ?)
-        `).run(
-          `${idx.collection_id}_${idx.key}`,
-          idx.collection_id,
-          idx.key,
-          idx.type,
-          orders.length ? `${attrs}|${orders.join(',')}` : attrs
-        );
-        
-        console.log(`  ${colors.green}✓${colors.reset} Created index: ${idx.key}`);
+        const indexKey = this.sanitizeIndexKey(idx.key);
+        if (this.debug) {
+          console.log(`  creating index ${idx.collection_id}.${indexKey} (${idx.type})`);
+        }
+        await this.appwriteClient.ensureIndex(dbId, idx.collection_id, {
+          key: indexKey,
+          type: idx.type || 'key',
+          attributes: idx.attributes || [],
+          orders: (idx.orders || []).filter(Boolean)
+        });
+        console.log(`  ${colors.green}✓${colors.reset} Created index ${idx.collection_id}.${indexKey}`);
       } catch (error) {
-        if (!error.message.includes('already exists')) {
+        if (error.status === 409) {
+          console.log(`  ${colors.gray}○${colors.reset} Index already exists: ${idx.collection_id}.${idx.key}`);
+        } else {
           throw error;
         }
-        console.log(`  ${colors.gray}○${colors.reset} Index already exists: ${idx.key}`);
       }
     }
-  }
-
-  isIgnorableCliError(error) {
-    const message = error?.message?.toLowerCase() || '';
-    return message.includes('not found') || message.includes('does not exist') || message.includes('404');
   }
 
   buildAttributeCommand(dbId, attr) {
@@ -674,419 +643,151 @@ class AWMImproved {
     const req = attr.required ? '--required true' : '--required false';
     const arr = attr.array ? '--array true' : '--array false';
     const type = attr.type.toLowerCase();
-    const defaultValue = !attr.array ? this.formatCliValue(attr.default, type) : null;
-
-    const parts = [];
+    const size = attr.size || 255;
 
     switch (type) {
       case 'string':
-        parts.push(`${base} create-string-attribute ${common} --size ${attr.size || 255}`);
-        break;
+        return `${base} create-string-attribute ${common} --size ${size} ${req} ${arr}`;
       case 'integer':
       case 'int':
-        parts.push(`${base} create-integer-attribute ${common}`);
-        break;
+        return `${base} create-integer-attribute ${common} ${req} ${arr}`;
       case 'float':
       case 'double':
-        parts.push(`${base} create-float-attribute ${common}`);
-        break;
+        return `${base} create-float-attribute ${common} ${req} ${arr}`;
       case 'boolean':
       case 'bool':
-        parts.push(`${base} create-boolean-attribute ${common}`);
-        break;
+        return `${base} create-boolean-attribute ${common} ${req} ${arr}`;
       case 'datetime':
-        parts.push(`${base} create-datetime-attribute ${common}`);
-        break;
+        return `${base} create-datetime-attribute ${common} ${req} ${arr}`;
       case 'email':
-        parts.push(`${base} create-email-attribute ${common}`);
-        break;
+        return `${base} create-email-attribute ${common} ${req} ${arr}`;
       case 'url':
-        parts.push(`${base} create-url-attribute ${common}`);
-        break;
+        return `${base} create-url-attribute ${common} ${req} ${arr}`;
       default:
-        throw new Error(`Unknown attribute type: ${attr.type}`);
-    }
-
-    parts.push(req, arr);
-
-    if (defaultValue !== null && defaultValue !== undefined) {
-      parts.push(`--default ${defaultValue}`);
-    }
-
-    return parts.join(' ');
-  }
-
-  async applyRelationships() {
-    console.log(`${colors.cyan}Applying relationships (Phase 2)...${colors.reset}\n`);
-    
-    const schema = this.parseSchema(fs.readFileSync(this.schemaFile, 'utf8'));
-    const relationships = this.extractRelationships(schema);
-    
-    if (relationships.length === 0) {
-      console.log(`${colors.yellow}No relationships defined in schema${colors.reset}`);
-      return;
-    }
-    
-    const dbId = this.databaseId;
-    
-    for (const rel of relationships) {
-      try {
-        // Check if relationship already exists
-        const existing = this.db.prepare(`
-          SELECT * FROM relationships 
-          WHERE from_collection = ? AND attribute_name = ?
-        `).get(rel.from_collection, rel.attribute_name);
-        
-        if (existing) {
-          console.log(`  ${colors.gray}○${colors.reset} Relationship already exists: ${rel.attribute_name}`);
-          continue;
-        }
-        
-        if (this.dryRun) {
-          console.log(`  [dry-run] Would create relationship: ${rel.from_collection}.${rel.attribute_name} → ${rel.to_collection}`);
-          continue;
-        }
-        
-        execSync(`appwrite databases create-relationship-attribute \
-          --database-id ${dbId} \
-          --collection-id "${rel.from_collection}" \
-          --related-collection-id "${rel.to_collection}" \
-          --type "${rel.type}" \
-          --key "${rel.attribute_name}" \
-          ${rel.two_way_key ? `--two-way-key "${rel.two_way_key}"` : ''} \
-          --on-delete "${rel.on_delete || 'restrict'}"`,
-          { stdio: 'pipe' }
-        );
-        
-        // Record in state DB
-        this.db.prepare(`
-          INSERT INTO relationships (id, from_collection, to_collection, type, attribute_name, two_way_key, on_delete)
-          VALUES (?, ?, ?, ?, ?, ?, ?)
-        `).run(
-          `${rel.from_collection}_${rel.attribute_name}`,
-          rel.from_collection,
-          rel.to_collection,
-          rel.type,
-          rel.attribute_name,
-          rel.two_way_key || null,
-          rel.on_delete || 'restrict'
-        );
-        
-        console.log(`  ${colors.green}✓${colors.reset} Created relationship: ${rel.attribute_name}`);
-      } catch (error) {
-        console.error(`  ${colors.red}✗${colors.reset} Failed to create relationship: ${error.message}`);
-      }
+        throw new Error(`Unsupported attribute type: ${attr.type}`);
     }
   }
 
-  async calculateChanges(schema) {
-    const changes = {
-      collections: [],
-      attributes: [],
-      indexes: []
+  async loadGenerators() {
+    const [types, zod] = await Promise.all([
+      import('./type-generator.js'),
+      import('./zod-generator.js')
+    ]);
+
+    return {
+      TypeGenerator: types.TypeGenerator,
+      ZodGenerator: zod.ZodGenerator
     };
-    
-    // Get existing state from DB
-    const existingColls = new Set(
-      this.db.prepare('SELECT id FROM collections').all().map(r => r.id)
-    );
-    
-    const existingAttrs = new Set(
-      this.db.prepare('SELECT collection_id || "." || key as id FROM attributes').all().map(r => r.id)
-    );
-    
-    const existingIndexes = new Set(
-      this.db.prepare('SELECT collection_id || "." || key as id FROM indexes').all().map(r => r.id)
-    );
-    
-    // Check collections
-    for (const [name, coll] of Object.entries(schema.collections || {})) {
-      const collId = this.toKebabCase(name);
-      
-      if (!existingColls.has(collId)) {
-        changes.collections.push({
-          id: collId,
-          name: coll.name || name,
-          ...coll
-        });
-      }
-      
-      // Check attributes
-      for (const [attrName, attr] of Object.entries(coll.attributes || {})) {
-        const attrId = `${collId}.${attrName}`;
-
-        if (attr.decorators?.relationship) {
-          continue;
-        }
-
-        if (!existingAttrs.has(attrId)) {
-          changes.attributes.push({
-            collection_id: collId,
-            key: attrName,
-            type: attr.type,
-            array: !!attr.array,
-            size: attr.size,
-            required: !!attr.required,
-            default: attr.default
-          });
-        }
-      }
-
-      // Check indexes
-      for (const index of coll.indexes || []) {
-        const indexAttributes = index.attributes || index.fields || [];
-        const key = index.name || `idx_${indexAttributes.join('_')}`;
-        const indexId = `${collId}.${key}`;
-
-        if (!existingIndexes.has(indexId)) {
-          changes.indexes.push({
-            collection_id: collId,
-            key,
-            type: index.type || 'key',
-            attributes: indexAttributes,
-            orders: index.orders || []
-          });
-        }
-      }
-    }
-    
-    return changes;
-  }
-
-  extractRelationships(schema) {
-    const relationships = [];
-    
-    for (const [collName, coll] of Object.entries(schema.collections || {})) {
-      const collId = this.toKebabCase(collName);
-      
-      // Look for relationship decorators
-      for (const [attrName, attr] of Object.entries(coll.attributes || {})) {
-        if (attr.decorators?.relationship) {
-          const rel = attr.decorators.relationship;
-          relationships.push({
-            from_collection: collId,
-            to_collection: this.toKebabCase(rel.to || attr.type),
-            type: rel.type || 'many-to-one',
-            attribute_name: attrName,
-            two_way_key: rel.twoWayKey,
-            on_delete: rel.onDelete || 'restrict'
-          });
-        }
-      }
-      
-      // Look for explicit relationships section
-      for (const rel of coll.relationships || []) {
-        relationships.push({
-          from_collection: collId,
-          to_collection: this.toKebabCase(rel.to),
-          type: rel.type || 'many-to-one',
-          attribute_name: rel.key,
-          two_way_key: rel.twoWayKey,
-          on_delete: rel.onDelete || 'restrict'
-        });
-      }
-    }
-    
-    return relationships;
-  }
-
-  async status() {
-    console.log(`${colors.cyan}Migration Status${colors.reset}\n`);
-    
-    const stats = {
-      collections: this.db.prepare('SELECT COUNT(*) as count FROM collections').get().count,
-      attributes: this.db.prepare('SELECT COUNT(*) as count FROM attributes').get().count,
-      indexes: this.db.prepare('SELECT COUNT(*) as count FROM indexes').get().count,
-      relationships: this.db.prepare('SELECT COUNT(*) as count FROM relationships').get().count,
-      migrations: {
-        applied: this.db.prepare('SELECT COUNT(*) as count FROM migrations WHERE status = "applied"').get().count,
-        planned: this.db.prepare('SELECT COUNT(*) as count FROM migrations WHERE status = "planned"').get().count,
-        failed: this.db.prepare('SELECT COUNT(*) as count FROM migrations WHERE status = "failed"').get().count,
-        rolledBack: this.db.prepare('SELECT COUNT(*) as count FROM migrations WHERE status = "rolled_back"').get().count
-      }
-    };
-    
-    console.log(`${colors.bright}Database State:${colors.reset}`);
-    console.log(`  Collections:   ${stats.collections}`);
-    console.log(`  Attributes:    ${stats.attributes}`);
-    console.log(`  Indexes:       ${stats.indexes}`);
-    console.log(`  Relationships: ${stats.relationships}`);
-    
-    console.log(`\n${colors.bright}Migrations:${colors.reset}`);
-    console.log(`  Applied: ${colors.green}${stats.migrations.applied}${colors.reset}`);
-    console.log(`  Planned: ${colors.yellow}${stats.migrations.planned}${colors.reset}`);
-    console.log(`  Failed:  ${colors.red}${stats.migrations.failed}${colors.reset}`);
-    console.log(`  Rolled back: ${colors.blue}${stats.migrations.rolledBack}${colors.reset}`);
-    
-    const recent = this.db.prepare(`
-      SELECT * FROM migrations 
-      ORDER BY applied_at DESC 
-      LIMIT 5
-    `).all();
-    
-    if (recent.length > 0) {
-      console.log(`\n${colors.bright}Recent Migrations:${colors.reset}`);
-      for (const m of recent) {
-        let icon = '○';
-        let color = colors.yellow;
-        if (m.status === 'applied') {
-          icon = '✓';
-          color = colors.green;
-        } else if (m.status === 'failed') {
-          icon = '✗';
-          color = colors.red;
-        } else if (m.status === 'rolled_back') {
-          icon = '↺';
-          color = colors.blue;
-        }
-        console.log(`  ${color}${icon}${colors.reset} ${m.id} - ${m.name} (${m.status})`);
-      }
-    }
-  }
-
-  async sync() {
-    console.log(`${colors.cyan}Syncing with Appwrite...${colors.reset}\n`);
-    
-    // This would fetch the actual state from Appwrite and update the local DB
-    // For now, just show a message
-    console.log(`${colors.yellow}⚠ Sync not yet implemented${colors.reset}`);
-    console.log(`This will fetch the current state from Appwrite and update the local tracking database.`);
-  }
-
-  async reset() {
-    console.log(`${colors.red}⚠ WARNING: This will reset all migration tracking${colors.reset}\n`);
-    
-    const answer = await this.prompt('Type "reset" to confirm: ');
-    if (answer !== 'reset') {
-      console.log('Reset cancelled.');
-      return;
-    }
-    
-    this.db.exec(`
-      DELETE FROM migrations;
-      DELETE FROM relationships;
-      DELETE FROM indexes;
-      DELETE FROM attributes;
-      DELETE FROM collections;
-    `);
-    
-    console.log(`${colors.green}✓${colors.reset} Migration state reset`);
   }
 
   parseSchema(content) {
     const schema = {
-      database: {},
-      collections: {},
-      enums: {}
+      databases: new Map(),
+      collections: {}
     };
-    
+
     const lines = content.split('\n');
     let currentBlock = null;
-    let currentType = null;
+    let currentCollection = null;
+    let currentDatabase = null;
     let bracketDepth = 0;
-    
+
     for (const line of lines) {
       const trimmed = line.trim();
-      
-      // Skip comments and empty lines
       if (!trimmed || trimmed.startsWith('//')) continue;
-      
-      // Track bracket depth
+
       bracketDepth += (trimmed.match(/{/g) || []).length;
       bracketDepth -= (trimmed.match(/}/g) || []).length;
-      
-      // Database block
+
       if (trimmed.startsWith('database')) {
         currentBlock = 'database';
-        currentType = null;
+        currentCollection = null;
+        currentDatabase = {};
         continue;
       }
-      
-      // Collection block
-      const collMatch = trimmed.match(/^collection\s+(\w+)\s*{?/);
+
+      const collMatch = trimmed.match(/^collection\s+(\w+)/);
       if (collMatch) {
         currentBlock = 'collection';
-        currentType = collMatch[1];
-        schema.collections[currentType] = {
-          name: currentType,
+        currentCollection = collMatch[1];
+        schema.collections[currentCollection] = {
+          name: currentCollection,
           attributes: {},
-          indexes: [],
-          relationships: []
+          indexes: []
         };
         continue;
       }
-      
-      // End of block
+
       if (bracketDepth === 0) {
+        if (currentBlock === 'database' && currentDatabase?.id) {
+          schema.databases.set(currentDatabase.id, currentDatabase);
+        }
         currentBlock = null;
-        currentType = null;
+        currentCollection = null;
+        currentDatabase = null;
         continue;
       }
-      
-      // Parse content based on current block
+
       if (currentBlock === 'database') {
         const match = trimmed.match(/(\w+)\s*=\s*"([^"]+)"/);
         if (match) {
-          schema.database[match[1]] = match[2];
+          currentDatabase[match[1]] = match[2];
         }
-      } else if (currentBlock === 'collection' && currentType) {
-        // Parse attributes
+        continue;
+      }
+
+      if (currentBlock === 'collection' && currentCollection) {
         const attrMatch = trimmed.match(/^(\w+)\s+(\w+)(\[\])?\s*(.*)/);
         if (attrMatch) {
           const [, name, type, isArray, decorators] = attrMatch;
           const decoratorData = this.parseDecorators(decorators);
           const normalizedDefault = this.normalizeDefaultValue(type, decoratorData.default);
-
           decoratorData.default = normalizedDefault;
 
-          schema.collections[currentType].attributes[name] = {
+          schema.collections[currentCollection].attributes[name] = {
             type,
             array: !!isArray,
             required: !!decoratorData.required,
             size: decoratorData.size,
             default: normalizedDefault,
-            unique: !!decoratorData.unique,
             decorators: decoratorData
           };
+          continue;
         }
 
-        // Parse indexes
         if (trimmed.startsWith('@@index')) {
           const indexMatch = trimmed.match(/@@index\(\[([^\]]+)\](?:,\s*([^)]+))?\)/);
           if (indexMatch) {
             const { fields, orders } = this.parseIndexFields(indexMatch[1]);
             let type = (indexMatch[2] || 'key').trim();
             if (['asc', 'desc'].includes(type.toLowerCase())) {
-              if (fields.length > 0) {
-                orders[0] = type.toLowerCase();
-              }
+              if (fields.length > 0) orders[0] = type.toLowerCase();
               type = 'key';
             }
-            schema.collections[currentType].indexes.push({
-              fields,
+            schema.collections[currentCollection].indexes.push({
+              attributes: fields,
               orders,
-              type,
-              attributes: fields
+              type
             });
           }
+          continue;
         }
 
-        // Parse unique constraint
         if (trimmed.startsWith('@@unique')) {
           const uniqueMatch = trimmed.match(/@@unique\(\[([^\]]+)\]\)/);
           if (uniqueMatch) {
             const { fields, orders } = this.parseIndexFields(uniqueMatch[1]);
-            schema.collections[currentType].indexes.push({
-              fields,
+            schema.collections[currentCollection].indexes.push({
+              attributes: fields,
               orders,
-              type: 'unique',
-              attributes: fields
+              type: 'unique'
             });
           }
+          continue;
         }
       }
     }
-    
+
     return schema;
   }
 
@@ -1095,9 +796,10 @@ class AWMImproved {
     const source = decoratorString || '';
     const regex = /@(\w+)(?:\(([^)]*)\))?/g;
     let match;
-    
+
     while ((match = regex.exec(source)) !== null) {
-      const [, name, params] = match;
+      const [, name, paramsRaw] = match;
+      const params = paramsRaw || '';
       if (name === 'size' && params) {
         decorators.size = parseInt(params, 10);
       } else if (name === 'required') {
@@ -1105,26 +807,24 @@ class AWMImproved {
       } else if (name === 'unique') {
         decorators.unique = true;
       } else if (name === 'default') {
-        decorators.default = params?.replace(/['"]/g, '');
+        decorators.default = params.replace(/['"]/g, '');
       } else if (name === 'relationship') {
-        // Parse relationship decorator
         decorators.relationship = this.parseRelationshipDecorator(params);
       } else {
         decorators[name] = params || true;
       }
     }
-    
+
     return decorators;
   }
 
   parseRelationshipDecorator(params) {
     const rel = {};
-    if (params) {
-      const parts = params.split(',').map(p => p.trim());
-      for (const part of parts) {
-        const [key, value] = part.split(':').map(s => s.trim());
-        rel[key] = value?.replace(/['"]/g, '');
-      }
+    if (!params) return rel;
+    const parts = params.split(',').map(p => p.trim());
+    for (const part of parts) {
+      const [key, value] = part.split(':').map(x => x.trim());
+      rel[key] = value?.replace(/['"]/g, '');
     }
     return rel;
   }
@@ -1140,8 +840,8 @@ class AWMImproved {
 
     for (const token of tokens) {
       const lower = token.toLowerCase();
-      if ((lower === 'asc' || lower === 'desc') && fields.length > 0) {
-        orders[fields.length - 1] = lower;
+      if ((lower === 'asc' || lower === 'desc') && fields.length) {
+        orders[fields.length - 1] = lower === 'desc' ? 'DESC' : 'ASC';
       } else {
         fields.push(token);
         orders.push(null);
@@ -1152,64 +852,37 @@ class AWMImproved {
   }
 
   normalizeDefaultValue(type, value) {
-    if (value === undefined || value === null || value === '') {
-      return undefined;
-    }
-
+    if (value === undefined || value === null || value === '') return undefined;
     const lowerType = type.toLowerCase();
-    const normalized = typeof value === 'string' ? value.trim() : value;
-
     if (lowerType === 'boolean' || lowerType === 'bool') {
-      if (typeof normalized === 'boolean') return normalized;
-      return ['true', '1', 'yes', 'on'].includes(String(normalized).toLowerCase());
+      return ['true', '1', 'yes', 'on'].includes(String(value).toLowerCase());
     }
-
     if (lowerType === 'integer' || lowerType === 'int') {
-      const parsed = parseInt(normalized, 10);
+      const parsed = parseInt(value, 10);
       return Number.isNaN(parsed) ? undefined : parsed;
     }
-
     if (lowerType === 'float' || lowerType === 'double') {
-      const parsed = parseFloat(normalized);
+      const parsed = parseFloat(value);
       return Number.isNaN(parsed) ? undefined : parsed;
     }
-
-    if (lowerType === 'datetime') {
-      const val = String(normalized).toLowerCase();
-      return val === 'now' ? 'now' : String(normalized);
-    }
-
-    return String(normalized);
-  }
-
-  formatCliValue(value, type) {
-    if (value === undefined || value === null) {
-      return null;
-    }
-
-    const lowerType = type.toLowerCase();
-
-    if (lowerType === 'boolean' || lowerType === 'bool') {
-      return value ? 'true' : 'false';
-    }
-
-    if (lowerType === 'integer' || lowerType === 'int' || lowerType === 'float' || lowerType === 'double') {
-      return `${value}`;
-    }
-
-    if (lowerType === 'datetime' && String(value).toLowerCase() === 'now') {
-      return 'now';
-    }
-
-    const str = String(value).replace(/"/g, '\\"');
-    return `"${str}"`;
+    return String(value);
   }
 
   toKebabCase(str) {
-    return str
-      .replace(/([a-z0-9])([A-Z])/g, '$1-$2')
-      .replace(/[\s_]+/g, '-')
-      .toLowerCase();
+    return str.replace(/([a-z0-9])([A-Z])/g, '$1-$2').replace(/[\s_]+/g, '-').toLowerCase();
+  }
+
+  sanitizeIndexKey(key) {
+    const cleaned = (key || '')
+      .replace(/^[^a-zA-Z0-9]+/, '')
+      .replace(/[^a-zA-Z0-9._-]/g, '_') || 'idx_hash';
+
+    if (cleaned.length <= 36) {
+      return cleaned;
+    }
+
+    const hash = crypto.createHash('md5').update(cleaned).digest('hex').slice(0, 28);
+    return `idx_${hash}`;
   }
 
   generateChecksum(data) {
@@ -1221,6 +894,7 @@ class AWMImproved {
       input: process.stdin,
       output: process.stdout
     });
+
     return new Promise(resolve => {
       rl.question(question, answer => {
         rl.close();
@@ -1231,63 +905,37 @@ class AWMImproved {
 
   showHelp() {
     console.log(`
-${colors.cyan}AWM - Appwrite Migration Tool (Improved)${colors.reset}
+${colors.cyan}AWM - Appwrite Migration Tool${colors.reset}
 
-${colors.bright}Usage:${colors.reset}
-  awm <command> [options]
+Usage: awm <command> [options]
 
-${colors.bright}Commands:${colors.reset}
-  ${colors.cyan}init${colors.reset}          Initialize AWM in your project
-  ${colors.cyan}plan${colors.reset}          Analyze schema and plan changes
-  ${colors.cyan}apply${colors.reset}         Apply pending migrations
-  ${colors.cyan}relationships${colors.reset} Apply relationship attributes (Phase 2)
-  ${colors.cyan}status${colors.reset}        Show current state and migrations
-  ${colors.cyan}sync${colors.reset}          Sync state with Appwrite
-  ${colors.cyan}reset${colors.reset}         Reset all migration tracking
-  
-  ${colors.dim}Code Generation:${colors.reset}
-  ${colors.cyan}generate-types${colors.reset}    Generate TypeScript types from schema
-  ${colors.cyan}generate-zod${colors.reset}      Generate Zod validation schemas
-  ${colors.cyan}generate${colors.reset}          Generate both types and Zod schemas
-
-${colors.bright}Options:${colors.reset}
-  --dry-run      Show what would be done without making changes
-  --yes          Skip confirmation prompts
-  --force        Continue on errors
-
-${colors.bright}Configuration (awm.config.json):${colors.reset}
-  {
-    "schemaPath": "appwrite.schema",
-    "migrationsDir": "migrations",
-    "stateDb": ".awm-state.db",
-    "databaseId": "my-database",
-    "projectId": "your-project-id",
-    "endpoint": "https://cloud.appwrite.io/v1"
-  }
-
-${colors.bright}Schema Example:${colors.reset}
-  collection Users {
-    name        String   @size(255) @required
-    email       String   @size(255) @unique
-    posts       Post[]   @relationship(type: "one-to-many", to: "Posts")
-    
-    @@index([email])
-  }
+Commands:
+  ${colors.cyan}plan${colors.reset}             Show pending schema changes
+  ${colors.cyan}apply${colors.reset}            Apply collections/attributes/indexes
+  ${colors.cyan}relationships${colors.reset}    Apply relationship attributes
+  ${colors.cyan}status${colors.reset}           Display database summary
+  ${colors.cyan}rollback${colors.reset}         Revert the last apply run
+  ${colors.cyan}reset${colors.reset}            Clear migration history
+  ${colors.cyan}generate-types${colors.reset}   Generate TypeScript types
+  ${colors.cyan}generate-zod${colors.reset}     Generate Zod schemas
+  ${colors.cyan}generate${colors.reset}         Generate both types and Zod schemas
 `);
   }
 }
 
 const main = async () => {
   const awm = new AWMImproved();
-  await awm.run();
-};
-
-if (import.meta.url === `file://${process.argv[1]}`) {
-  main().catch(error => {
-    console.error('❌ Error:', error.message);
-    if (error.stack && process.env.AWM_DEBUG === 'true') {
+  try {
+    await awm.run();
+  } catch (error) {
+    console.error(`${colors.red}✗ ${error.message}${colors.reset}`);
+    if (process.env.AWM_DEBUG === 'true' && error.stack) {
       console.error(error.stack);
     }
     process.exit(1);
-  });
+  }
+};
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main();
 }
