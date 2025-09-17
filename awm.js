@@ -627,13 +627,17 @@ class AWMImproved {
       }
       
       try {
-        const attrs = idx.attributes.join(',');
+        const attrs = (idx.attributes || []).join(',');
+        const orders = (idx.orders || []).filter(Boolean).map(order => order.toUpperCase());
+        const orderFlag = orders.length ? ` \\
+          --orders "${orders.join(',')}"` : '';
+
         execSync(`appwrite databases create-index \
           --database-id ${dbId} \
           --collection-id "${idx.collection_id}" \
           --key "${idx.key}" \
           --type "${idx.type}" \
-          --attributes "${attrs}"`,
+          --attributes "${attrs}"${orderFlag}`,
           { stdio: 'pipe' }
         );
         
@@ -646,7 +650,7 @@ class AWMImproved {
           idx.collection_id,
           idx.key,
           idx.type,
-          attrs
+          orders.length ? `${attrs}|${orders.join(',')}` : attrs
         );
         
         console.log(`  ${colors.green}✓${colors.reset} Created index: ${idx.key}`);
@@ -669,28 +673,47 @@ class AWMImproved {
     const common = `--database-id ${dbId} --collection-id "${attr.collection_id}" --key "${attr.key}"`;
     const req = attr.required ? '--required true' : '--required false';
     const arr = attr.array ? '--array true' : '--array false';
-    
-    switch (attr.type.toLowerCase()) {
+    const type = attr.type.toLowerCase();
+    const defaultValue = !attr.array ? this.formatCliValue(attr.default, type) : null;
+
+    const parts = [];
+
+    switch (type) {
       case 'string':
-        return `${base} create-string-attribute ${common} --size ${attr.size || 255} ${req} ${arr}`;
+        parts.push(`${base} create-string-attribute ${common} --size ${attr.size || 255}`);
+        break;
       case 'integer':
       case 'int':
-        return `${base} create-integer-attribute ${common} ${req} ${arr}`;
+        parts.push(`${base} create-integer-attribute ${common}`);
+        break;
       case 'float':
       case 'double':
-        return `${base} create-float-attribute ${common} ${req} ${arr}`;
+        parts.push(`${base} create-float-attribute ${common}`);
+        break;
       case 'boolean':
       case 'bool':
-        return `${base} create-boolean-attribute ${common} ${req} ${arr}`;
+        parts.push(`${base} create-boolean-attribute ${common}`);
+        break;
       case 'datetime':
-        return `${base} create-datetime-attribute ${common} ${req} ${arr}`;
+        parts.push(`${base} create-datetime-attribute ${common}`);
+        break;
       case 'email':
-        return `${base} create-email-attribute ${common} ${req} ${arr}`;
+        parts.push(`${base} create-email-attribute ${common}`);
+        break;
       case 'url':
-        return `${base} create-url-attribute ${common} ${req} ${arr}`;
+        parts.push(`${base} create-url-attribute ${common}`);
+        break;
       default:
         throw new Error(`Unknown attribute type: ${attr.type}`);
     }
+
+    parts.push(req, arr);
+
+    if (defaultValue !== null && defaultValue !== undefined) {
+      parts.push(`--default ${defaultValue}`);
+    }
+
+    return parts.join(' ');
   }
 
   async applyRelationships() {
@@ -791,16 +814,24 @@ class AWMImproved {
       // Check attributes
       for (const [attrName, attr] of Object.entries(coll.attributes || {})) {
         const attrId = `${collId}.${attrName}`;
-        
+
+        if (attr.decorators?.relationship) {
+          continue;
+        }
+
         if (!existingAttrs.has(attrId)) {
           changes.attributes.push({
             collection_id: collId,
             key: attrName,
-            ...attr
+            type: attr.type,
+            array: !!attr.array,
+            size: attr.size,
+            required: !!attr.required,
+            default: attr.default
           });
         }
       }
-      
+
       // Check indexes
       for (const index of coll.indexes || []) {
         const indexAttributes = index.attributes || index.fields || [];
@@ -812,7 +843,8 @@ class AWMImproved {
             collection_id: collId,
             key,
             type: index.type || 'key',
-            attributes: indexAttributes
+            attributes: indexAttributes,
+            orders: index.orders || []
           });
         }
       }
@@ -1002,34 +1034,51 @@ class AWMImproved {
         const attrMatch = trimmed.match(/^(\w+)\s+(\w+)(\[\])?\s*(.*)/);
         if (attrMatch) {
           const [, name, type, isArray, decorators] = attrMatch;
+          const decoratorData = this.parseDecorators(decorators);
+          const normalizedDefault = this.normalizeDefaultValue(type, decoratorData.default);
+
+          decoratorData.default = normalizedDefault;
+
           schema.collections[currentType].attributes[name] = {
             type,
             array: !!isArray,
-            decorators: this.parseDecorators(decorators)
+            required: !!decoratorData.required,
+            size: decoratorData.size,
+            default: normalizedDefault,
+            unique: !!decoratorData.unique,
+            decorators: decoratorData
           };
         }
-        
+
         // Parse indexes
         if (trimmed.startsWith('@@index')) {
-          const indexMatch = trimmed.match(/@@index\(\[([^\]]+)\](?:,\s*(\w+))?\)/);
+          const indexMatch = trimmed.match(/@@index\(\[([^\]]+)\](?:,\s*([^)]+))?\)/);
           if (indexMatch) {
-            const fields = indexMatch[1].split(',').map(f => f.trim());
-            const type = indexMatch[2] || 'key';
+            const { fields, orders } = this.parseIndexFields(indexMatch[1]);
+            let type = (indexMatch[2] || 'key').trim();
+            if (['asc', 'desc'].includes(type.toLowerCase())) {
+              if (fields.length > 0) {
+                orders[0] = type.toLowerCase();
+              }
+              type = 'key';
+            }
             schema.collections[currentType].indexes.push({
               fields,
+              orders,
               type,
               attributes: fields
             });
           }
         }
-        
+
         // Parse unique constraint
         if (trimmed.startsWith('@@unique')) {
           const uniqueMatch = trimmed.match(/@@unique\(\[([^\]]+)\]\)/);
           if (uniqueMatch) {
-            const fields = uniqueMatch[1].split(',').map(f => f.trim());
+            const { fields, orders } = this.parseIndexFields(uniqueMatch[1]);
             schema.collections[currentType].indexes.push({
               fields,
+              orders,
               type: 'unique',
               attributes: fields
             });
@@ -1043,10 +1092,11 @@ class AWMImproved {
 
   parseDecorators(decoratorString) {
     const decorators = {};
+    const source = decoratorString || '';
     const regex = /@(\w+)(?:\(([^)]*)\))?/g;
     let match;
     
-    while ((match = regex.exec(decoratorString)) !== null) {
+    while ((match = regex.exec(source)) !== null) {
       const [, name, params] = match;
       if (name === 'size' && params) {
         decorators.size = parseInt(params, 10);
@@ -1077,6 +1127,82 @@ class AWMImproved {
       }
     }
     return rel;
+  }
+
+  parseIndexFields(fieldString) {
+    const tokens = fieldString
+      .split(',')
+      .map(token => token.trim())
+      .filter(Boolean);
+
+    const fields = [];
+    const orders = [];
+
+    for (const token of tokens) {
+      const lower = token.toLowerCase();
+      if ((lower === 'asc' || lower === 'desc') && fields.length > 0) {
+        orders[fields.length - 1] = lower;
+      } else {
+        fields.push(token);
+        orders.push(null);
+      }
+    }
+
+    return { fields, orders };
+  }
+
+  normalizeDefaultValue(type, value) {
+    if (value === undefined || value === null || value === '') {
+      return undefined;
+    }
+
+    const lowerType = type.toLowerCase();
+    const normalized = typeof value === 'string' ? value.trim() : value;
+
+    if (lowerType === 'boolean' || lowerType === 'bool') {
+      if (typeof normalized === 'boolean') return normalized;
+      return ['true', '1', 'yes', 'on'].includes(String(normalized).toLowerCase());
+    }
+
+    if (lowerType === 'integer' || lowerType === 'int') {
+      const parsed = parseInt(normalized, 10);
+      return Number.isNaN(parsed) ? undefined : parsed;
+    }
+
+    if (lowerType === 'float' || lowerType === 'double') {
+      const parsed = parseFloat(normalized);
+      return Number.isNaN(parsed) ? undefined : parsed;
+    }
+
+    if (lowerType === 'datetime') {
+      const val = String(normalized).toLowerCase();
+      return val === 'now' ? 'now' : String(normalized);
+    }
+
+    return String(normalized);
+  }
+
+  formatCliValue(value, type) {
+    if (value === undefined || value === null) {
+      return null;
+    }
+
+    const lowerType = type.toLowerCase();
+
+    if (lowerType === 'boolean' || lowerType === 'bool') {
+      return value ? 'true' : 'false';
+    }
+
+    if (lowerType === 'integer' || lowerType === 'int' || lowerType === 'float' || lowerType === 'double') {
+      return `${value}`;
+    }
+
+    if (lowerType === 'datetime' && String(value).toLowerCase() === 'now') {
+      return 'now';
+    }
+
+    const str = String(value).replace(/"/g, '\\"');
+    return `"${str}"`;
   }
 
   toKebabCase(str) {
