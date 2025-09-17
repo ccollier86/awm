@@ -1,9 +1,8 @@
 #!/usr/bin/env node
-"use strict";
 
 /**
  * AWM - Appwrite Migration Tool (Improved)
- * 
+ *
  * Features:
  * - Tracks migration state in SQLite database
  * - Only creates/modifies what doesn't exist
@@ -12,17 +11,19 @@
  * - Dry-run mode
  */
 
-const fs = require('fs');
-const path = require('path');
-const { execSync } = require('child_process');
-const Database = require('better-sqlite3');
-const crypto = require('crypto');
-const readline = require('readline');
+import fs from 'fs';
+import path from 'path';
+import { execSync } from 'child_process';
+import Database from 'better-sqlite3';
+import crypto from 'crypto';
+import readline from 'readline';
+import dotenv from 'dotenv';
 
 // Colors for console output
 const colors = {
   reset: '\x1b[0m',
   bright: '\x1b[1m',
+  dim: '\x1b[2m',
   green: '\x1b[32m',
   yellow: '\x1b[33m',
   blue: '\x1b[34m',
@@ -87,7 +88,7 @@ class AWMImproved {
     // Check for .env file
     const envFile = path.join(this.root, '.env');
     if (fs.existsSync(envFile)) {
-      require('dotenv').config({ path: envFile });
+      dotenv.config({ path: envFile });
     }
     
     return {};
@@ -183,7 +184,7 @@ class AWMImproved {
           await this.status();
           break;
         case 'rollback':
-          await this.rollback(this.args[0]);
+          await this.rollback(this.firstPositionalArg());
           break;
         case 'reset':
           await this.reset();
@@ -194,8 +195,25 @@ class AWMImproved {
         case 'relationships':
           await this.applyRelationships();
           break;
-        default:
+        case 'generate-types':
+          await this.generateTypes(this.firstPositionalArg() || './types/appwrite.types.ts');
+          break;
+        case 'generate-zod':
+          await this.generateZod(this.firstPositionalArg() || './schemas/appwrite.schemas.ts');
+          break;
+        case 'generate': {
+          const [typesPath, zodPath] = this.positionalArgs(2);
+          await this.generateArtifacts(typesPath || './types/appwrite.types.ts', zodPath || './schemas/appwrite.schemas.ts');
+          break;
+        }
+        case 'help':
+        case undefined:
           this.showHelp();
+          break;
+        default:
+          console.error(`${colors.red}Unknown command: ${this.command}${colors.reset}`);
+          this.showHelp();
+          process.exit(1);
       }
     } catch (error) {
       console.error(`${colors.red}✗ Error: ${error.message}${colors.reset}`);
@@ -208,51 +226,55 @@ class AWMImproved {
     }
   }
 
+  positionalArgs(limit = Infinity) {
+    const values = [];
+    for (const arg of this.args) {
+      if (arg?.startsWith('--')) continue;
+      values.push(arg);
+      if (values.length >= limit) break;
+    }
+    return values;
+  }
+
+  firstPositionalArg() {
+    return this.positionalArgs(1)[0];
+  }
+
+  async loadGenerators() {
+    if (!this.generators) {
+      const [{ default: TypeGenerator }, { default: ZodGenerator }] = await Promise.all([
+        import('./type-generator.js'),
+        import('./zod-generator.js')
+      ]);
+      this.generators = { TypeGenerator, ZodGenerator };
+    }
+    return this.generators;
+  }
+
+  async generateTypes(outputPath) {
+    const { TypeGenerator } = await this.loadGenerators();
+    const generator = new TypeGenerator(this.schemaFile);
+    await generator.generate(outputPath);
+  }
+
+  async generateZod(outputPath) {
+    const { ZodGenerator } = await this.loadGenerators();
+    const generator = new ZodGenerator(this.schemaFile);
+    await generator.generate(outputPath);
+  }
+
+  async generateArtifacts(typesPath, zodPath) {
+    console.log('\n🚀 Generating TypeScript types and Zod schemas...\n');
+    await this.generateTypes(typesPath);
+    await this.generateZod(zodPath);
+    console.log('\n✨ All generators completed successfully!');
+  }
+
   async init() {
     console.log(`${colors.cyan}Initializing AWM in ${this.root}${colors.reset}\n`);
-    
-    // Check if we have required env vars
-    const hasEnvConfig = process.env.APPWRITE_PROJECT_ID && process.env.APPWRITE_ENDPOINT;
-    
-    // Create example config file if no config exists and no env vars
-    const configFile = path.join(this.root, 'awm.config.json');
-    if (!fs.existsSync(configFile) && !hasEnvConfig) {
-      const exampleConfig = {
-        "_comment": "AWM Config - ENV vars override these settings",
-        "schemaPath": "appwrite.schema",
-        "migrationsDir": "migrations",
-        "endpoint": "http://localhost/v1",
-        "projectId": "your-project-id",
-        "apiKey": "your-api-key-if-needed",
-        "databaseId": null,
-        "debug": false
-      };
-      fs.writeFileSync(configFile, JSON.stringify(exampleConfig, null, 2));
-      console.log(`${colors.green}✓${colors.reset} Created example awm.config.json`);
-      console.log(`${colors.yellow}⚠${colors.reset} Set APPWRITE_PROJECT_ID and APPWRITE_ENDPOINT env vars`);
-      console.log(`   or update awm.config.json with your project details`);
-    } else if (hasEnvConfig) {
-      console.log(`${colors.green}✓${colors.reset} Using environment variables for configuration`);
-    }
 
-    // Create example schema if it doesn't exist
-    if (!fs.existsSync(this.schemaFile)) {
-      const exampleSchema = `// Appwrite Schema Definition
-database {
-  name = "my-database"
-  id   = "my-database"
-}
-
-collection Users {
-  name            String   @size(255) @required
-  email           String   @size(255) @required @unique
-  created_at      DateTime @default(now)
-  
-  @@index([email])
-}`;
-      fs.writeFileSync(this.schemaFile, exampleSchema);
-      console.log(`${colors.green}✓${colors.reset} Created example schema file`);
-    }
+    const { default: initProject } = await import('./init.js');
+    await initProject();
 
     console.log(`\n${colors.green}✓ AWM initialized successfully!${colors.reset}`);
   }
@@ -388,8 +410,149 @@ collection Users {
     }
   }
 
+  async rollback(requestedId) {
+    console.log(`${colors.cyan}Rolling back migration state...${colors.reset}\n`);
+
+    const migration = requestedId
+      ? this.db.prepare('SELECT * FROM migrations WHERE id = ?').get(requestedId)
+      : this.db.prepare(`
+          SELECT * FROM migrations
+          WHERE status = 'applied'
+          ORDER BY applied_at DESC
+          LIMIT 1
+        `).get();
+
+    if (!migration) {
+      console.log(`${colors.yellow}No applied migrations found to roll back.${colors.reset}`);
+      return;
+    }
+
+    if (migration.status !== 'applied') {
+      console.log(`${colors.yellow}Migration ${migration.id} is not applied (current status: ${migration.status}). Nothing to roll back.${colors.reset}`);
+      return;
+    }
+
+    const changesFile = path.join(this.migrationsDir, `${migration.id}.json`);
+    if (!fs.existsSync(changesFile)) {
+      console.error(`${colors.red}✗ Unable to rollback: migration plan file missing (${changesFile}).${colors.reset}`);
+      return;
+    }
+
+    const changes = JSON.parse(fs.readFileSync(changesFile, 'utf8'));
+    const dbId = this.databaseId;
+
+    const stats = { indexes: 0, attributes: 0, collections: 0 };
+
+    const deleteIndex = idx => {
+      const label = `${idx.collection_id}.${idx.key}`;
+      if (this.dryRun) {
+        stats.indexes++;
+        console.log(`  [dry-run] Would delete index: ${label}`);
+        return;
+      }
+
+      try {
+        execSync(`appwrite databases delete-index \\
+          --database-id ${dbId} \\
+          --collection-id "${idx.collection_id}" \\
+          --key "${idx.key}"`, { stdio: 'pipe' });
+        stats.indexes++;
+        console.log(`  ${colors.green}✓${colors.reset} Deleted index: ${label}`);
+      } catch (error) {
+        if (this.isIgnorableCliError(error)) {
+          console.log(`  ${colors.gray}○${colors.reset} Index already removed: ${label}`);
+        } else if (this.force) {
+          console.warn(`  ${colors.yellow}⚠${colors.reset} Failed to delete index ${label}: ${error.message}`);
+        } else {
+          throw error;
+        }
+      } finally {
+        this.db.prepare('DELETE FROM indexes WHERE id = ?').run(`${idx.collection_id}_${idx.key}`);
+      }
+    };
+
+    const deleteAttribute = attr => {
+      const label = `${attr.collection_id}.${attr.key}`;
+      if (this.dryRun) {
+        stats.attributes++;
+        console.log(`  [dry-run] Would delete attribute: ${label}`);
+        return;
+      }
+
+      try {
+        execSync(`appwrite databases delete-attribute \\
+          --database-id ${dbId} \\
+          --collection-id "${attr.collection_id}" \\
+          --key "${attr.key}"`, { stdio: 'pipe' });
+        stats.attributes++;
+        console.log(`  ${colors.green}✓${colors.reset} Deleted attribute: ${label}`);
+      } catch (error) {
+        if (this.isIgnorableCliError(error)) {
+          console.log(`  ${colors.gray}○${colors.reset} Attribute already removed: ${label}`);
+        } else if (this.force) {
+          console.warn(`  ${colors.yellow}⚠${colors.reset} Failed to delete attribute ${label}: ${error.message}`);
+        } else {
+          throw error;
+        }
+      } finally {
+        this.db.prepare('DELETE FROM attributes WHERE id = ?').run(`${attr.collection_id}_${attr.key}`);
+      }
+    };
+
+    const deleteCollection = coll => {
+      if (this.dryRun) {
+        stats.collections++;
+        console.log(`  [dry-run] Would delete collection: ${coll.id}`);
+        return;
+      }
+
+      try {
+        execSync(`appwrite databases delete-collection \\
+          --database-id ${dbId} \\
+          --collection-id "${coll.id}"`, { stdio: 'pipe' });
+        stats.collections++;
+        console.log(`  ${colors.green}✓${colors.reset} Deleted collection: ${coll.id}`);
+      } catch (error) {
+        if (this.isIgnorableCliError(error)) {
+          console.log(`  ${colors.gray}○${colors.reset} Collection already removed: ${coll.id}`);
+        } else if (this.force) {
+          console.warn(`  ${colors.yellow}⚠${colors.reset} Failed to delete collection ${coll.id}: ${error.message}`);
+        } else {
+          throw error;
+        }
+      } finally {
+        this.db.prepare('DELETE FROM collections WHERE id = ?').run(coll.id);
+      }
+    };
+
+    try {
+      // Process indexes first to avoid attribute dependencies
+      [...(changes.indexes || [])].reverse().forEach(deleteIndex);
+      // Then attributes
+      [...(changes.attributes || [])].reverse().forEach(deleteAttribute);
+      // Finally collections
+      [...(changes.collections || [])].reverse().forEach(deleteCollection);
+
+      if (!this.dryRun) {
+        this.db.prepare(`
+          UPDATE migrations
+          SET status = 'rolled_back', applied_at = CURRENT_TIMESTAMP
+          WHERE id = ?
+        `).run(migration.id);
+      }
+
+      console.log(`\n${colors.green}✓${colors.reset} Rollback complete for ${migration.id}`);
+      console.log(`  Collections removed: ${stats.collections}`);
+      console.log(`  Attributes removed:  ${stats.attributes}`);
+      console.log(`  Indexes removed:     ${stats.indexes}`);
+    } catch (error) {
+      console.error(`${colors.red}✗ Rollback failed: ${error.message}${colors.reset}`);
+      if (!this.force) throw error;
+    }
+  }
+
   async applyChanges(changes) {
-    const dbId = this.config.databaseId || 'database';
+    const dbId = this.databaseId;
     
     // Create collections
     for (const coll of changes.collections || []) {
@@ -496,6 +659,11 @@ collection Users {
     }
   }
 
+  isIgnorableCliError(error) {
+    const message = error?.message?.toLowerCase() || '';
+    return message.includes('not found') || message.includes('does not exist') || message.includes('404');
+  }
+
   buildAttributeCommand(dbId, attr) {
     const base = `appwrite databases`;
     const common = `--database-id ${dbId} --collection-id "${attr.collection_id}" --key "${attr.key}"`;
@@ -536,7 +704,7 @@ collection Users {
       return;
     }
     
-    const dbId = this.config.databaseId || 'database';
+    const dbId = this.databaseId;
     
     for (const rel of relationships) {
       try {
@@ -635,14 +803,16 @@ collection Users {
       
       // Check indexes
       for (const index of coll.indexes || []) {
-        const indexId = `${collId}.${index.name || index.attributes.join('_')}`;
-        
+        const indexAttributes = index.attributes || index.fields || [];
+        const key = index.name || `idx_${indexAttributes.join('_')}`;
+        const indexId = `${collId}.${key}`;
+
         if (!existingIndexes.has(indexId)) {
           changes.indexes.push({
             collection_id: collId,
-            key: index.name || `idx_${index.attributes.join('_')}`,
+            key,
             type: index.type || 'key',
-            attributes: index.attributes || index.fields
+            attributes: indexAttributes
           });
         }
       }
@@ -699,7 +869,8 @@ collection Users {
       migrations: {
         applied: this.db.prepare('SELECT COUNT(*) as count FROM migrations WHERE status = "applied"').get().count,
         planned: this.db.prepare('SELECT COUNT(*) as count FROM migrations WHERE status = "planned"').get().count,
-        failed: this.db.prepare('SELECT COUNT(*) as count FROM migrations WHERE status = "failed"').get().count
+        failed: this.db.prepare('SELECT COUNT(*) as count FROM migrations WHERE status = "failed"').get().count,
+        rolledBack: this.db.prepare('SELECT COUNT(*) as count FROM migrations WHERE status = "rolled_back"').get().count
       }
     };
     
@@ -713,6 +884,7 @@ collection Users {
     console.log(`  Applied: ${colors.green}${stats.migrations.applied}${colors.reset}`);
     console.log(`  Planned: ${colors.yellow}${stats.migrations.planned}${colors.reset}`);
     console.log(`  Failed:  ${colors.red}${stats.migrations.failed}${colors.reset}`);
+    console.log(`  Rolled back: ${colors.blue}${stats.migrations.rolledBack}${colors.reset}`);
     
     const recent = this.db.prepare(`
       SELECT * FROM migrations 
@@ -723,8 +895,18 @@ collection Users {
     if (recent.length > 0) {
       console.log(`\n${colors.bright}Recent Migrations:${colors.reset}`);
       for (const m of recent) {
-        const icon = m.status === 'applied' ? '✓' : m.status === 'failed' ? '✗' : '○';
-        const color = m.status === 'applied' ? colors.green : m.status === 'failed' ? colors.red : colors.yellow;
+        let icon = '○';
+        let color = colors.yellow;
+        if (m.status === 'applied') {
+          icon = '✓';
+          color = colors.green;
+        } else if (m.status === 'failed') {
+          icon = '✗';
+          color = colors.red;
+        } else if (m.status === 'rolled_back') {
+          icon = '↺';
+          color = colors.blue;
+        }
         console.log(`  ${color}${icon}${colors.reset} ${m.id} - ${m.name} (${m.status})`);
       }
     }
@@ -969,88 +1151,17 @@ ${colors.bright}Schema Example:${colors.reset}
   }
 }
 
-// Run the tool
-const awm = new AWMImproved();
-
-// Import generators dynamically
-const loadGenerators = async () => {
-  const TypeGenerator = (await import('./type-generator.js')).default;
-  const ZodGenerator = (await import('./zod-generator.js')).default;
-  return { TypeGenerator, ZodGenerator };
+const main = async () => {
+  const awm = new AWMImproved();
+  await awm.run();
 };
 
-// Main CLI execution
-(async () => {
-  const command = process.argv[2];
-  const args = process.argv.slice(3);
-  
-  try {
-    switch (command) {
-      case 'init':
-        const { default: initProject } = await import('./init.js');
-        await initProject();
-        break;
-        
-      case 'apply':
-        await awm.apply();
-        break;
-        
-      case 'relationships':
-        await awm.applyRelationships();
-        break;
-        
-      case 'status':
-        await awm.status();
-        break;
-        
-      case 'rollback':
-        await awm.rollback(args[0]);
-        break;
-        
-      case 'generate-types':
-        const { TypeGenerator } = await loadGenerators();
-        const typeGen = new TypeGenerator(awm.schemaFile);
-        const outputPath = args[0] || './types/appwrite.types.ts';
-        await typeGen.generate(outputPath);
-        break;
-        
-      case 'generate-zod':
-        const { ZodGenerator } = await loadGenerators();
-        const zodGen = new ZodGenerator(awm.schemaFile);
-        const zodOutputPath = args[0] || './schemas/appwrite.schemas.ts';
-        await zodGen.generate(zodOutputPath);
-        break;
-        
-      case 'generate':
-        // Generate both types and schemas
-        const generators = await loadGenerators();
-        
-        console.log('\n🚀 Generating TypeScript types and Zod schemas...\n');
-        
-        const typeGenerator = new generators.TypeGenerator(awm.schemaFile);
-        await typeGenerator.generate(args[0] || './types/appwrite.types.ts');
-        
-        const zodGenerator = new generators.ZodGenerator(awm.schemaFile);
-        await zodGenerator.generate(args[1] || './schemas/appwrite.schemas.ts');
-        
-        console.log('\n✨ All generators completed successfully!');
-        break;
-        
-      case 'help':
-      case undefined:
-        awm.printHelp();
-        break;
-        
-      default:
-        console.error(`Unknown command: ${command}`);
-        awm.printHelp();
-        process.exit(1);
-    }
-  } catch (error) {
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch(error => {
     console.error('❌ Error:', error.message);
     if (error.stack && process.env.AWM_DEBUG === 'true') {
       console.error(error.stack);
     }
     process.exit(1);
-  }
-})();
+  });
+}
