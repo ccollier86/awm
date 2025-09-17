@@ -1,37 +1,19 @@
 #!/usr/bin/env node
 
-/**
- * ICD-10 migration script
- *
- * Reads rows from the existing SQLite database (icd10.db)
- * and inserts/updates documents in the Appwrite `icd10_codes` collection
- * using the new schema.
- */
-
-import { spawn } from 'child_process';
-import fs from 'fs';
 import path from 'path';
-import os from 'os';
+import fs from 'fs';
+import { spawn } from 'child_process';
 import dotenv from 'dotenv';
 
-import { AppwriteClient } from '../awm-package/lib/appwrite.js';
+import { AppwriteClient } from '../lib/appwrite.js';
 
-const DEFAULT_SQLITE_PATH = path.resolve(process.cwd(), '../icd10.db');
 const BATCH_SIZE = parseInt(process.env.ICD10_MIGRATION_BATCH || '500', 10);
+const DEFAULT_SQLITE_PATH = path.resolve(process.cwd(), '../icd10.db');
 
 function loadEnv() {
   const envFile = path.resolve(process.cwd(), '../.env');
-  if (os.type() !== 'Windows_NT' && !process.env.APPWRITE_PROJECT_ID && fsExists(envFile)) {
+  if (fs.existsSync(envFile)) {
     dotenv.config({ path: envFile });
-  }
-}
-
-function fsExists(targetPath) {
-  try {
-    fs.statSync(targetPath);
-    return true;
-  } catch {
-    return false;
   }
 }
 
@@ -49,22 +31,26 @@ function normalizeCode(code) {
 
 async function fetchRows(sqlitePath) {
   return new Promise((resolve, reject) => {
+    if (!fs.existsSync(sqlitePath)) {
+      return reject(new Error(`SQLite database not found at ${sqlitePath}`));
+    }
+
     const rows = [];
-   const sqlite = spawn('sqlite3', [
-     sqlitePath,
-     "-cmd",
-     ".mode list",
-     "-cmd",
-     ".separator |",
-     "SELECT code, description, category, subcategory, parent_code, IFNULL(is_dsm5,0), dsm5_description, created_at FROM icd10_codes ORDER BY code;"
-   ]);
+    const sqlite = spawn('sqlite3', [
+      sqlitePath,
+      '-cmd',
+      '.mode list',
+      '-cmd',
+      '.separator |',
+      'SELECT code, description, category, subcategory, parent_code, IFNULL(is_dsm5,0), dsm5_description, created_at FROM icd10_codes ORDER BY code;'
+    ]);
+
+    let stdout = '';
+    let stderr = '';
 
     sqlite.on('error', error => {
       reject(new Error(`Failed to launch sqlite3: ${error.message}`));
     });
-
-    let stdout = '';
-    let stderr = '';
 
     sqlite.stdout.on('data', chunk => {
       stdout += chunk.toString();
@@ -81,8 +67,6 @@ async function fetchRows(sqlitePath) {
 
       const lines = stdout.split('\n').filter(Boolean);
       for (const line of lines) {
-        const parts = line.split('|');
-        if (parts.length < 6) continue;
         const [
           codeValue,
           description,
@@ -92,7 +76,7 @@ async function fetchRows(sqlitePath) {
           isDsm5Raw,
           dsm5Description,
           createdAtRaw
-        ] = parts;
+        ] = line.split('|');
 
         rows.push({
           code: codeValue,
@@ -113,18 +97,17 @@ async function fetchRows(sqlitePath) {
 
 async function upsert(client, databaseId, collectionId, row) {
   const documentId = normalizeCode(row.code);
- const payload = {
-   code: row.code,
-   description: row.description,
-   category: row.category,
-   subcategory: row.subcategory,
-   parent_code: row.parent_code,
-   is_dsm5: row.is_dsm5,
-   dsm5_description: row.dsm5_description,
-    dsm5_category: null,
-    dsm5_subcategory: null,
-    created_at: row.created_at ? new Date(row.created_at).toISOString() : new Date().toISOString(),
-    last_verified: new Date().toISOString(),
+  const nowIso = new Date().toISOString();
+  const payload = {
+    code: row.code,
+    description: row.description,
+    category: row.category,
+    subcategory: row.subcategory,
+    parent_code: row.parent_code,
+    is_dsm5: row.is_dsm5,
+    dsm5_description: row.dsm5_description,
+    created_at: row.created_at ? new Date(row.created_at).toISOString() : nowIso,
+    last_verified: nowIso,
     version: 1
   };
 
@@ -144,9 +127,9 @@ async function main() {
   loadEnv();
 
   const sqlitePath = process.env.SQLITE_DB_PATH || DEFAULT_SQLITE_PATH;
-  const appwriteEndpoint = requireEnv('APPWRITE_ENDPOINT');
-  const appwriteProject = requireEnv('APPWRITE_PROJECT_ID');
-  const appwriteKey = requireEnv('APPWRITE_API_KEY');
+  const endpoint = requireEnv('APPWRITE_ENDPOINT');
+  const projectId = requireEnv('APPWRITE_PROJECT_ID');
+  const apiKey = requireEnv('APPWRITE_API_KEY');
   const databaseId = requireEnv('APPWRITE_DATABASE_ID');
   const collectionId = 'icd10-codes';
 
@@ -155,9 +138,9 @@ async function main() {
   console.log(`Found ${rows.length} rows`);
 
   const client = new AppwriteClient({
-    endpoint: appwriteEndpoint,
-    projectId: appwriteProject,
-    apiKey: appwriteKey
+    endpoint,
+    projectId,
+    apiKey
   });
 
   let created = 0;
@@ -182,8 +165,6 @@ async function main() {
 
 main().catch(error => {
   console.error('Migration failed:', error.message);
-  if (error.stack) {
-    console.error(error.stack);
-  }
+  if (error.stack) console.error(error.stack);
   process.exit(1);
 });
