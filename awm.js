@@ -272,13 +272,16 @@ class AWMImproved {
             .split('-')
             .map((part, index) => index === 0 ? part.toLowerCase() : part.charAt(0).toUpperCase() + part.slice(1))
             .join('');
+          const twoWay = rel.two_way_key ? '--two-way true' : '';
+          const twoWayKeyArg = rel.two_way_key ? `--two-way-key "${rel.two_way_key}"` : '';
           execSync(`appwrite databases create-relationship-attribute \
             --database-id ${this.databaseId} \
             --collection-id "${rel.collection}" \
             --related-collection-id "${rel.to_collection}" \
             --type "${relType}" \
             --key "${rel.key}" \
-            ${rel.two_way_key ? `--two-way-key "${rel.two_way_key}"` : ''} \
+            ${twoWayKeyArg} \
+            ${twoWay} \
             --on-delete "${rel.on_delete || 'restrict'}"`, { stdio: 'pipe' });
           console.log(`  ${colors.green}✓${colors.reset} Relationship ${rel.collection}.${rel.key}`);
         } catch (error) {
@@ -290,16 +293,17 @@ class AWMImproved {
         }
       }
 
-      await this.stateStore.recordHistory({
-        type: 'relationships',
-        databaseId: this.databaseId,
-        relationships: relationships.map(rel => ({
-          collection: rel.collection,
-          key: rel.key,
-          to_collection: rel.to_collection,
-          type: rel.type
-        }))
-      });
+        await this.stateStore.recordHistory({
+          type: 'relationships',
+          databaseId: this.databaseId,
+          relationships: relationships.map(rel => ({
+            collection: rel.collection,
+            key: rel.key,
+            to_collection: rel.to_collection,
+            type: rel.type,
+            twoWayKey: rel.two_way_key || null
+          }))
+        });
 
       console.log(`\n${colors.green}✓ Relationships applied${colors.reset}`);
     });
