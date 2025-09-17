@@ -1,6 +1,6 @@
 {
 	"name": "@catalystlabs/awm",
-	"version": "2.0.2",
+	"version": "2.0.3",
 	"description": "Appwrite Migration Tool - Schema management and code generation for Appwrite databases",
 	"type": "module",
 	"main": "awm.js",
